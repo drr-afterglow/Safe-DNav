@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(dnav_bringup)
+find_package(catkin REQUIRED COMPONENTS roscpp std_msgs)
+catkin_package()
+include_directories(${catkin_INCLUDE_DIRS})
+add_executable(dnav_auto_takeoff src/dnav_auto_takeoff.cpp)
+target_link_libraries(dnav_auto_takeoff ${catkin_LIBRARIES})
+install(DIRECTORY launch config DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

@@ -1,0 +1,129 @@
+import torch
+
+from perception_training.perception_training.geometry import integrate_body_angular_velocity
+
+
+def generate_mid360_nonrepetitive_pattern(
+    num_envs,
+    points_per_frame,
+    vfov_deg,
+    scan_duration,
+    frame_index,
+    phase,
+    device,
+):
+    """Generate a deterministic low-discrepancy MID-360 scan approximation.
+
+    MID-360 does not behave like a fixed multi-line spinning lidar. This
+    sequence covers the full 360 x 59 degree FOV without repeating the same
+    rays between consecutive frames. ``phase`` gives every simulated sensor an
+    independent, reproducible scan phase.
+
+    Returns body-frame FLU ray directions and point acquisition offsets in
+    seconds relative to the scan end (negative to zero).
+    """
+    if points_per_frame <= 0:
+        raise ValueError("points_per_frame must be positive")
+    if scan_duration <= 0:
+        raise ValueError("scan_duration must be positive")
+    if phase.shape != (num_envs, 2):
+        raise ValueError("phase must have shape (num_envs, 2)")
+
+    dtype = torch.float32
+    local_index = torch.arange(points_per_frame, device=device, dtype=dtype)
+    global_index = local_index + float(frame_index * points_per_frame)
+    # Irrational increments form a two-dimensional low-discrepancy sequence.
+    azimuth_unit = torch.remainder(
+        global_index.unsqueeze(0) * 0.6180339887498949 + phase[:, 0:1],
+        1.0,
+    )
+    elevation_unit = torch.remainder(
+        global_index.unsqueeze(0) * 0.7548776662466927 + phase[:, 1:2],
+        1.0,
+    )
+    yaw = azimuth_unit * (2.0 * torch.pi) - torch.pi
+    pitch_min = float(vfov_deg[0]) * torch.pi / 180.0
+    pitch_max = float(vfov_deg[1]) * torch.pi / 180.0
+    pitch = pitch_min + elevation_unit * (pitch_max - pitch_min)
+    directions = torch.stack(
+        [
+            torch.cos(pitch) * torch.cos(yaw),
+            torch.cos(pitch) * torch.sin(yaw),
+            torch.sin(pitch),
+        ],
+        dim=-1,
+    )
+    point_time_offsets = (
+        (local_index + 0.5) / float(points_per_frame) * float(scan_duration) - float(scan_duration)
+    )
+    return directions, point_time_offsets.unsqueeze(0).expand(num_envs, -1)
+
+
+def scan_ray_poses(
+    end_pos_w,
+    end_quat_w,
+    end_linear_vel_w,
+    linear_accel_w,
+    end_angular_vel_body,
+    angular_accel_body,
+    point_time_offsets,
+):
+    """Reconstruct every ray pose relative to the scan-end state."""
+    t = point_time_offsets.unsqueeze(-1)
+    ray_pos_w = (
+        end_pos_w.unsqueeze(1)
+        + end_linear_vel_w.unsqueeze(1) * t
+        + 0.5 * linear_accel_w.unsqueeze(1) * t.square()
+    )
+    rotation_vector = (
+        end_angular_vel_body.unsqueeze(1) * t
+        + 0.5 * angular_accel_body.unsqueeze(1) * t.square()
+    )
+    ray_quat_w = integrate_body_angular_velocity(
+        end_quat_w.unsqueeze(1).expand(-1, point_time_offsets.shape[1], -1),
+        rotation_vector,
+        1.0,
+    )
+    return ray_pos_w, ray_quat_w
+
+
+def dynamic_sphere_positions_at_rays(
+    end_positions_w, velocities_w, point_time_offsets, accelerations_w=None
+):
+    """Return constant-acceleration sphere centers at every ray timestamp."""
+    positions = (
+        end_positions_w.view(1, 1, -1, 3)
+        + point_time_offsets.unsqueeze(-1).unsqueeze(-1)
+        * velocities_w.view(1, 1, -1, 3)
+    )
+    if accelerations_w is not None:
+        t = point_time_offsets.unsqueeze(-1).unsqueeze(-1)
+        positions = positions + 0.5 * t.square() * accelerations_w.view(1, 1, -1, 3)
+    return positions
+def sphere_lidar_hits(lidar_range, spheres_pos, spheres_radius, pos_w, ray_dirs_w):
+    bsz, num_rays, _ = ray_dirs_w.shape
+    origins = pos_w if pos_w.ndim == 3 else pos_w.unsqueeze(1)
+    if spheres_pos.numel() == 0:
+        hits = origins + ray_dirs_w * lidar_range
+        is_hit = torch.zeros((bsz, num_rays), dtype=torch.bool, device=ray_dirs_w.device)
+        hit_idx = torch.zeros((bsz, num_rays), dtype=torch.long, device=ray_dirs_w.device)
+        return hits, is_hit, hit_idx
+
+    p = origins.unsqueeze(2)
+    d = ray_dirs_w.unsqueeze(2)
+    c = spheres_pos if spheres_pos.ndim == 4 else spheres_pos.unsqueeze(0).unsqueeze(0)
+    r = spheres_radius.view(1, 1, -1, 1)
+    l = c - p
+    t_ca = torch.sum(l * d, dim=-1, keepdim=True)
+    d_sq = torch.sum(l * l, dim=-1, keepdim=True) - t_ca.square()
+    discriminant = r.square() - d_sq
+    t_hc = torch.sqrt(torch.clamp(discriminant, min=0.0))
+    t0 = t_ca - t_hc
+    valid = (discriminant >= 0.0) & (t0 > 0.0) & (t0 < lidar_range)
+    t0_vals = t0.squeeze(-1)
+    t0_vals = torch.where(valid.squeeze(-1), t0_vals, torch.full_like(t0_vals, float("inf")))
+    min_t, hit_idx = torch.min(t0_vals, dim=-1)
+    is_hit = torch.isfinite(min_t)
+    final_t = torch.where(is_hit, min_t, torch.full_like(min_t, lidar_range))
+    hits = origins + final_t.unsqueeze(-1) * ray_dirs_w
+    return hits, is_hit, hit_idx

@@ -1,0 +1,24 @@
+algo:
+  feature_extractor:
+    learning_rate: 5e-6     #8e-5    #2e-4    
+  
+  actor:
+    learning_rate: 5e-6      #8e-5     #2e-4
+    clip_ratio: 0.1
+    action_limit: 3.0 # m/s
+  
+  critic:
+    learning_rate: 5e-6       #8e-5      #2e-4
+    clip_ratio: 0.1
+  
+  entropy_loss_coefficient: 2e-5       #5e-5             #1e-3 # encourage exploration
+  cbf_lambda_init: 0.33
+  cbf_lambda_lr: 1e-3
+  cbf_cost_limit: 0.02
+  cbf_lambda_max: 1.0
+
+
+  training_frame_num: 32  #单次单个无人机采集的训练帧数
+  training_epoch_num: 4   #重复训练次数
+  num_minibatches: 8      # split into N minibatches
+

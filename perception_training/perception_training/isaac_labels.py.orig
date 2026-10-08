@@ -1,0 +1,186 @@
+#监督标签
+
+from typing import Dict, Optional
+
+import torch
+
+from .geometry import PanoramaSpec, project_points_to_panorama, project_range_and_valid, quat_rotate_inverse, transform_world_to_body
+
+
+def validate_supervised_batch(
+    batch: Dict[str, torch.Tensor],
+    expected_size,
+    min_delta_t: float = 0.05,
+    max_delta_t: float = 0.15,
+) -> None:
+    """Fail fast when a collector produces physically inconsistent labels."""
+    height, width = expected_size
+    expected_shapes = {
+        "input": (4, height, width),
+        "mask": (1, height, width),
+        "velocity": (3, height, width),
+        "valid": (1, height, width),
+    }
+    batch_size = batch["input"].shape[0]
+    for key, sample_shape in expected_shapes.items():
+        if key not in batch:
+            raise ValueError(f"supervised batch is missing {key}")
+        if tuple(batch[key].shape) != (batch_size, *sample_shape):
+            raise ValueError(f"invalid {key} shape: {tuple(batch[key].shape)}")
+        if not bool(torch.isfinite(batch[key]).all()):
+            raise ValueError(f"{key} contains non-finite values")
+    if float(batch["input"].min()) < -1e-5 or float(batch["input"].max()) > 1.0 + 1e-5:
+        raise ValueError("normalized range input must stay in [0, 1]")
+    ranges = batch["input"][:, :2]
+    return_valid = batch["input"][:, 2:4]
+    if not bool(((return_valid == 0.0) | (return_valid == 1.0)).all()):
+        raise ValueError("return-valid input channels must be binary")
+    if bool((ranges[return_valid < 0.5] < 1.0 - 1e-5).any()):
+        raise ValueError("invalid returns must use normalized max-range fill value 1.0")
+    if not bool(torch.equal(batch["valid"] > 0.5, return_valid[:, 0:1] > 0.5)):
+        raise ValueError("supervision valid mask must equal current_return_valid")
+    if float(batch["mask"].min()) < 0.0 or float(batch["mask"].max()) > 1.0:
+        raise ValueError("dynamic mask must stay in [0, 1]")
+    if float(batch["valid"].min()) < 0.0 or float(batch["valid"].max()) > 1.0:
+        raise ValueError("valid mask must stay in [0, 1]")
+    if float((batch["mask"] * (1.0 - batch["valid"])).abs().max()) > 1e-5:
+        raise ValueError("dynamic mask cannot be positive without a current valid return")
+    static_velocity = batch["velocity"] * (1.0 - batch["mask"])
+    if float(static_velocity.abs().max()) > 1e-5:
+        raise ValueError("velocity labels must be zero outside the dynamic mask")
+    delta_t = batch["delta_t"]
+    if tuple(delta_t.shape) != (batch_size,) or not bool(torch.isfinite(delta_t).all()):
+        raise ValueError("delta_t must be a finite (B,) tensor")
+    if float(delta_t.min()) < min_delta_t or float(delta_t.max()) > max_delta_t:
+        raise ValueError(f"delta_t must stay in [{min_delta_t}, {max_delta_t}] seconds")
+
+def merge_hits_by_nearest(
+    static_hits_w: torch.Tensor,
+    dyn_hits_w: torch.Tensor,
+    pos_w: torch.Tensor,
+    is_dyn_hit: torch.Tensor,
+) -> torch.Tensor:
+    if pos_w.ndim == 3:
+        pos = pos_w
+    else:
+        pos = pos_w.unsqueeze(1)
+    static_dist = torch.linalg.norm(static_hits_w - pos, dim=-1)
+    dyn_dist = torch.linalg.norm(dyn_hits_w - pos, dim=-1)
+    use_dyn = is_dyn_hit & (dyn_dist < static_dist)
+    return torch.where(use_dyn.unsqueeze(-1), dyn_hits_w, static_hits_w)
+
+
+def visible_dynamic_mask(
+    static_hits_w: torch.Tensor,
+    dyn_hits_w: torch.Tensor,
+    pos_w: torch.Tensor,
+    is_dyn_hit: torch.Tensor,
+) -> torch.Tensor:
+    if pos_w.ndim == 3:
+        pos = pos_w
+    else:
+        pos = pos_w.unsqueeze(1)
+    static_dist = torch.linalg.norm(static_hits_w - pos, dim=-1)
+    dyn_dist = torch.linalg.norm(dyn_hits_w - pos, dim=-1)
+    return is_dyn_hit & (dyn_dist < static_dist)
+
+
+def build_supervised_batch_from_isaac(
+    curr_static_hits_w: torch.Tensor,
+    curr_dyn_hits_w: torch.Tensor,
+    prev_hits_w: torch.Tensor,
+    is_dyn_hit: torch.Tensor,
+    dyn_hit_idx: torch.Tensor,
+    all_dyn_vel_w: torch.Tensor,
+    pos_w: torch.Tensor,
+    quat_w: torch.Tensor,
+    spec: PanoramaSpec,
+    dyn_max_vel: Optional[float] = None,
+    delta_t: float = 0.096,
+    curr_input_hits_w: Optional[torch.Tensor] = None,
+    prev_alignment_pos_w: Optional[torch.Tensor] = None,
+    prev_alignment_quat_w: Optional[torch.Tensor] = None,
+    curr_return_valid: Optional[torch.Tensor] = None,
+    prev_return_valid: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build one supervised SA-UMNet batch from Isaac tensors.
+
+    This is intended to be called near the existing env.py perception code while
+    simulator truth is still available.
+    """
+    visible_dyn = visible_dynamic_mask(curr_static_hits_w, curr_dyn_hits_w, pos_w, is_dyn_hit)
+    curr_input_body = transform_world_to_body(
+        curr_hits_w if curr_input_hits_w is None else curr_input_hits_w,
+        pos_w,
+        quat_w,
+    )
+    dyn_body = transform_world_to_body(curr_dyn_hits_w, pos_w, quat_w)
+    prev_body = transform_world_to_body(
+        prev_hits_w,
+        pos_w if prev_alignment_pos_w is None else prev_alignment_pos_w,
+        quat_w if prev_alignment_quat_w is None else prev_alignment_quat_w,
+    )
+
+    curr_depth, curr_valid = project_range_and_valid(curr_input_body, spec, curr_return_valid)
+    prev_depth, prev_valid = project_range_and_valid(prev_body, spec, prev_return_valid)
+    net_input = torch.cat([curr_depth, prev_depth, curr_valid, prev_valid], dim=1)
+
+    # Project labels with the exact geometry and valid-ray mask used by the
+    # noisy current input. Radial noise can change which of several rays wins
+    # a panorama pixel; using clean geometry here would misalign mask/velocity
+    # labels with the depth actually observed by the network.
+    projection_valid = None if curr_return_valid is None else curr_return_valid.bool()
+    mask_values = visible_dyn.to(curr_depth.dtype).unsqueeze(-1)
+    mask = project_points_to_panorama(
+        curr_input_body,
+        spec,
+        values=mask_values,
+        valid_mask=projection_valid,
+        reduce="nearest",
+    ).clamp(0.0, 1.0)
+    mask = mask * curr_valid
+
+    if all_dyn_vel_w.numel() == 0:
+        hit_obj_vel = torch.zeros_like(curr_dyn_hits_w)
+    else:
+        safe_idx = dyn_hit_idx.clamp(0, max(all_dyn_vel_w.shape[0] - 1, 0))
+        hit_obj_vel = all_dyn_vel_w[safe_idx]
+    quat = quat_w.unsqueeze(1).expand(-1, hit_obj_vel.shape[1], -1) if quat_w.ndim == 2 else quat_w.expand(-1, hit_obj_vel.shape[1], -1)
+    # Ego motion is already removed by temporal alignment. The supervised
+    # target is therefore absolute obstacle velocity expressed in the current
+    # FLU body frame; relative velocity is constructed downstream.
+    absolute_vel_body = quat_rotate_inverse(quat, hit_obj_vel)
+
+    dist = torch.linalg.norm(dyn_body, dim=-1, keepdim=True).clamp_min(1e-6)
+    r_hat = dyn_body / dist
+    v_r = (absolute_vel_body * r_hat).sum(dim=-1, keepdim=True)
+    tangent = absolute_vel_body - v_r * r_hat
+    x, y, _ = dyn_body.unbind(dim=-1)
+    yaw_hat = torch.stack([-y, x, torch.zeros_like(x)], dim=-1)
+    yaw_hat = yaw_hat / torch.linalg.norm(yaw_hat, dim=-1, keepdim=True).clamp_min(1e-6)
+    # r x e_theta is the increasing-pitch direction (positive upward).
+    pitch_hat = torch.cross(r_hat, yaw_hat, dim=-1)
+    v_theta = (tangent * yaw_hat).sum(dim=-1, keepdim=True)
+    v_phi = (tangent * pitch_hat).sum(dim=-1, keepdim=True)
+    velocity = torch.cat([v_r, v_theta, v_phi], dim=-1)
+    if dyn_max_vel is not None:
+        velocity = velocity.clamp(-dyn_max_vel, dyn_max_vel)
+
+    velocity = torch.where(visible_dyn.unsqueeze(-1), velocity, torch.zeros_like(velocity))
+    vel_img = project_points_to_panorama(
+        curr_input_body,
+        spec,
+        values=velocity,
+        valid_mask=projection_valid,
+        reduce="nearest",
+    )
+    vel_img = vel_img * mask
+    valid = curr_valid
+    frame_interval = torch.full((net_input.shape[0],), float(delta_t), device=net_input.device, dtype=net_input.dtype)
+    return {
+        "input": net_input,
+        "mask": mask,
+        "velocity": vel_img,
+        "valid": valid,
+        "delta_t": frame_interval,
+    }

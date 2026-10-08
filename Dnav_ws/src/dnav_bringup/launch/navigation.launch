@@ -1,0 +1,50 @@
+<launch>
+  <arg name="start_gazebo" default="true"/>
+  <arg name="start_perception" default="true"/>
+  <arg name="start_policy" default="true"/>
+  <arg name="start_controller" default="true"/>
+  <arg name="start_safety_filter" default="true"/>
+  <arg name="auto_takeoff" default="false"/>
+  <arg name="perception_device" default="cuda"/>
+  <arg name="policy_device" default="cpu"/>
+  <arg name="controller_config" default="$(find dnav_controller)/config/controller_with_obstacle_safety.yaml"/>
+  <arg name="safety_filter_config" default="$(find dnav_controller)/config/obstacle_safety.yaml"/>
+  <arg name="python_executable" default="/home/amo/miniconda3/envs/NavRL/bin/python"/>
+  <arg name="world_name" default="$(find dnav_gazebo)/worlds/generated_env/generated_env_static.world"/>
+  <arg name="spawn_x" default="-15.0"/>
+  <arg name="spawn_y" default="0.0"/>
+  <arg name="spawn_z" default="0.1"/>
+  <arg name="spawn_yaw" default="0.0"/>
+  <arg name="gazebo_gui" default="true"/>
+
+  <include if="$(arg start_gazebo)" file="$(find dnav_gazebo)/launch/start.launch">
+    <arg name="world_name" value="$(arg world_name)"/>
+    <arg name="spawn_x" value="$(arg spawn_x)"/>
+    <arg name="spawn_y" value="$(arg spawn_y)"/>
+    <arg name="spawn_z" value="$(arg spawn_z)"/>
+    <arg name="spawn_yaw" value="$(arg spawn_yaw)"/>
+    <arg name="gui" value="$(arg gazebo_gui)"/>
+  </include>
+
+  <include if="$(arg start_perception)" file="$(find dnav_perception)/launch/perception.launch">
+    <arg name="device" value="$(arg perception_device)"/>
+    <arg name="python_executable" value="$(arg python_executable)"/>
+  </include>
+
+  <include if="$(arg start_policy)" file="$(find dnav_policy)/launch/policy.launch">
+    <arg name="device" value="$(arg policy_device)"/>
+    <arg name="python_executable" value="$(arg python_executable)"/>
+  </include>
+
+  <include if="$(arg start_safety_filter)" file="$(find dnav_controller)/launch/obstacle_safety.launch">
+    <arg name="config" value="$(arg safety_filter_config)"/>
+  </include>
+
+  <include if="$(arg start_controller)" file="$(find dnav_controller)/launch/controller.launch">
+    <arg name="config" value="$(arg controller_config)"/>
+  </include>
+
+  <node if="$(arg auto_takeoff)" pkg="dnav_bringup"
+        type="dnav_auto_takeoff" name="dnav_auto_takeoff"
+        output="screen"/>
+</launch>

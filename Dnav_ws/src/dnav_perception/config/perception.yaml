@@ -1,0 +1,34 @@
+scan_topic: /dnav/uav/mid360/scan
+odom_topic: /dnav/uav/odom_raw
+output_topic: /dnav/perception/observation
+diagnostics_topic: /dnav/perception/diagnostics
+depth_debug_topic: /dnav/perception/debug/depth
+dynamic_probability_topic: /dnav/perception/debug/dynamic_probability
+publish_debug_images: true
+sensor_frame: mid360_link
+body_frame: base_link
+
+model_file: models/perception_best.ts.pt
+device: cuda
+
+height: 16
+width: 180
+scan_height: 16
+scan_width: 360
+max_range: 10.0
+vertical_min_deg: -7.0
+vertical_max_deg: 52.0
+sensor_vertical_min_deg: -7.0
+sensor_vertical_max_deg: 52.0
+
+reference_delta_t: 0.096
+min_delta_t: 0.05
+max_delta_t: 0.15
+mask_threshold: 0.50
+dyn_max_vel: 5.0
+rl_height: 6
+rl_width: 36
+
+pose_tolerance: 0.05
+tf_timeout: 0.10
+worker_rate: 200.0

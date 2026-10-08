@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>dnav_controller</name>
+  <version>0.1.0</version>
+  <description>Safety-gated world-velocity adapter for Safe-DNav.</description>
+  <maintainer email="safe-dnav@example.com">Safe-DNav</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>dnav_perception</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+</package>

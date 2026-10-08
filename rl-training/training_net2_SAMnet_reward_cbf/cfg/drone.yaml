@@ -1,0 +1,58 @@
+drone:
+  model_name: "hummingbird"
+
+sensor:
+  lidar_range: 10.0
+  lidar_hfov: 360.0
+  lidar_vfov: [-7.0, 52.0]
+  lidar_vbeams: 6
+  lidar_hbeams: 36
+
+# Final learned-perception observation contract.  The proxy parameters are
+# randomized around the frozen 12K-v2 SA-UMNet test metrics so that a policy
+# cannot depend on perfect simulator labels before zero-shot deployment.
+perception:
+  mode: "proxy_randomized"
+  dynamic_channels: 5
+  dyn_max_vel_mps: 5.0
+  uncertainty_scale_mps: 10.0
+
+  # SA-UMNet reference interval is 0.096 s while the simulator step is 0.016 s.
+  proxy_update_interval_steps: 3
+
+  # Test recall is 0.85259 overall and lower at long range.
+  proxy_near_recall: 0.92
+  proxy_far_recall: 0.76
+  proxy_recall_jitter: 0.05
+
+  # Test pixel FPR is 0.01793 at threshold 0.50.
+  proxy_false_positive_rate_min: 0.005
+  proxy_false_positive_rate_max: 0.025
+
+  # Approximate the measured per-component errors; radial error is largest.
+  proxy_velocity_noise_std_mps: [0.85, 0.60, 0.60]
+  proxy_velocity_noise_scale_min: 0.75
+  proxy_velocity_noise_scale_max: 1.25
+  proxy_velocity_bias_std_mps: 0.10
+  proxy_false_positive_velocity_std_mps: 0.35
+
+  # Correlate reported uncertainty with sampled velocity error.
+  proxy_sigma_floor_mps: 0.20
+  proxy_sigma_error_gain: 1.0
+  proxy_sigma_max_mps: 2.5
+
+  proxy_depth_noise_std_m: 0.02
+  proxy_min_dynamic_speed_mps: 0.05
+  proxy_occlusion_epsilon_m: 0.01
+
+# Robust CBF-derived state cost. Units are metres, seconds and m/s.
+cbf:
+  safe_distance_m: 0.9
+  barrier_gain: 1.2
+  confidence_scale: 2.0
+  ego_velocity_sigma_mps: 0.05
+  valid_depth_threshold: 0.99
+  ttc_horizon_s: 1.2
+  topk: 16
+  topk_mean_weight: 0.7
+

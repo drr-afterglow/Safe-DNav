@@ -1,0 +1,6 @@
+<launch>
+	<arg name="pose_topic" default="/dnav/uav/pose"/>
+	<node name="quadcopterTF" pkg="dnav_gazebo" type="quadcopterTFBroadcaster" args="$(arg pose_topic)" output="screen"/>
+	<node pkg="tf2_ros" type="static_transform_publisher" name="baselink_mid360link"
+	  args="0.01416 -0.00296 0.11720 0 0 0 base_link mid360_link" />
+</launch>

@@ -1,0 +1,270 @@
+#部署运行时适配
+from pathlib import Path
+from typing import Optional, Tuple, Union
+
+import torch
+
+from .geometry import (
+    PanoramaSpec,
+    absolute_to_relative_spherical_velocity,
+    align_previous_body_frame,
+    deskew_points_body,
+    make_network_input,
+    project_points_to_panorama,
+)
+from .model import SAUMNet
+from .postprocess import build_rl_observation
+
+
+class LearnedPerceptionModule:
+    """Runtime adapter that returns observations compatible with RL backends."""
+
+    def __init__(
+        self,
+        checkpoint: Optional[str],
+        spec: PanoramaSpec,
+        dyn_max_vel: float,
+        device: str = "cuda",
+        dynamic_channels: int = 5,
+        base_channels: int = 16,
+        input_channels: int = 4,
+        reference_delta_t: float = 0.096,
+        min_delta_t: float = 0.05,
+        max_delta_t: float = 0.15,
+        max_scan_duration: float = 0.15,
+        mask_threshold: float = 0.5,
+        rl_spec: Optional[PanoramaSpec] = None,
+    ):
+        self.spec = spec
+        self.rl_spec = rl_spec or spec
+        self.device = torch.device(device)
+        self.dyn_max_vel = dyn_max_vel
+        self.dynamic_channels = dynamic_channels
+        state = None
+        if checkpoint:
+            state = torch.load(Path(checkpoint), map_location=self.device)
+            ckpt_cfg = state.get("config", {}) if isinstance(state, dict) else {}
+            model_cfg = ckpt_cfg.get("model", {}) if isinstance(ckpt_cfg, dict) else {}
+            base_channels = int(model_cfg.get("base_channels", base_channels))
+            input_channels = int(model_cfg.get("input_channels", input_channels))
+            reference_delta_t = float(model_cfg.get("reference_delta_t", reference_delta_t))
+            min_delta_t = float(model_cfg.get("min_delta_t", min_delta_t))
+            max_delta_t = float(model_cfg.get("max_delta_t", max_delta_t))
+            sensor_cfg = ckpt_cfg.get("sensor", {}) if isinstance(ckpt_cfg, dict) else {}
+            max_scan_duration = float(sensor_cfg.get("max_scan_duration", max_scan_duration))
+            network_cfg = sensor_cfg.get("network", {}) if isinstance(sensor_cfg, dict) else {}
+            if network_cfg:
+                self.spec = PanoramaSpec(
+                    height=int(network_cfg.get("height", self.spec.height)),
+                    width=int(network_cfg.get("width", self.spec.width)),
+                    max_range=float(sensor_cfg.get("max_range", self.spec.max_range)),
+                    vfov_deg=tuple(sensor_cfg.get("vfov_deg", self.spec.vfov_deg)),
+                )
+            rl_cfg = sensor_cfg.get("rl", {}) if isinstance(sensor_cfg, dict) else {}
+            if rl_cfg:
+                self.rl_spec = PanoramaSpec(
+                    height=int(rl_cfg.get("height", self.rl_spec.height)),
+                    width=int(rl_cfg.get("width", self.rl_spec.width)),
+                    max_range=float(sensor_cfg.get("max_range", self.rl_spec.max_range)),
+                    vfov_deg=tuple(sensor_cfg.get("vfov_deg", self.rl_spec.vfov_deg)),
+                )
+        self.model = SAUMNet(
+            height=self.spec.height,
+            width=self.spec.width,
+            vfov_deg=self.spec.vfov_deg,
+            base_channels=base_channels,
+            input_channels=input_channels,
+            reference_delta_t=reference_delta_t,
+            min_delta_t=min_delta_t,
+            max_delta_t=max_delta_t,
+        ).to(self.device)
+        if state is not None:
+            self.model.load_state_dict(state.get("model", state))
+        self.model.eval()
+        self.reference_delta_t = reference_delta_t
+        self.min_delta_t = min_delta_t
+        self.max_delta_t = max_delta_t
+        self.max_scan_duration = float(max_scan_duration)
+        self.mask_threshold = float(mask_threshold)
+        if not 0.0 < self.mask_threshold < 1.0:
+            raise ValueError("mask_threshold must be in (0, 1)")
+        if self.max_scan_duration <= 0:
+            raise ValueError("max_scan_duration must be positive")
+        self.last_history_valid = False
+        self.prev_points_body = None
+        self.prev_return_valid = None
+        self.prev_pos_w = None
+        self.prev_quat_w = None
+
+    def _deskew_current_frame(
+        self,
+        points_body: torch.Tensor,
+        point_times: Optional[torch.Tensor],
+        point_linear_vel_body: Optional[torch.Tensor],
+        point_angular_vel_body: Optional[torch.Tensor],
+        frame_time: Optional[Union[float, torch.Tensor]],
+    ) -> torch.Tensor:
+        if point_times is None:
+            if point_linear_vel_body is not None or point_angular_vel_body is not None or frame_time is not None:
+                raise ValueError("point times, pointwise IMU motion and frame_time must be provided together")
+            return points_body
+        if point_linear_vel_body is None or point_angular_vel_body is None or frame_time is None:
+            raise ValueError(
+                "deskew requires curr_point_times, point_linear_vel_body, "
+                "point_angular_vel_body and curr_frame_time"
+            )
+
+        # Preserve sub-second precision even when timestamps use a large
+        # absolute epoch (common in ROS bags).
+        times = point_times.to(device=self.device, dtype=torch.float64)
+        if times.ndim == 1:
+            times = times.unsqueeze(0)
+        if times.shape != points_body.shape[:2]:
+            raise ValueError("curr_point_times must have shape (B, N) matching curr_points_body")
+        frame_time_tensor = torch.as_tensor(frame_time, device=self.device, dtype=torch.float64)
+        if frame_time_tensor.ndim == 0:
+            frame_time_tensor = frame_time_tensor.expand(points_body.shape[0])
+        if frame_time_tensor.ndim != 1 or frame_time_tensor.shape[0] != points_body.shape[0]:
+            raise ValueError("curr_frame_time must be a scalar or have shape (B,)")
+        scan_age = frame_time_tensor.unsqueeze(-1) - times
+        if not bool(torch.isfinite(scan_age).all()):
+            raise ValueError("point/frame timestamps must be finite")
+        if float(scan_age.min()) < -1e-6:
+            raise ValueError("point timestamps cannot be later than curr_frame_time")
+        if float(scan_age.max()) > self.max_scan_duration:
+            raise ValueError(
+                f"scan duration {float(scan_age.max()):.6f}s exceeds "
+                f"max_scan_duration={self.max_scan_duration:.6f}s"
+            )
+        linear_velocity = point_linear_vel_body.to(device=self.device, dtype=points_body.dtype)
+        angular_velocity = point_angular_vel_body.to(device=self.device, dtype=points_body.dtype)
+        valid_motion_shapes = {
+            (3,),
+            (points_body.shape[0], 3),
+            (points_body.shape[0], points_body.shape[1], 3),
+        }
+        if tuple(linear_velocity.shape) not in valid_motion_shapes:
+            raise ValueError("point_linear_vel_body must have shape (3,), (B,3), or (B,N,3)")
+        if tuple(angular_velocity.shape) not in valid_motion_shapes:
+            raise ValueError("point_angular_vel_body must have shape (3,), (B,3), or (B,N,3)")
+        return deskew_points_body(
+            points_body,
+            times,
+            linear_velocity,
+            angular_velocity,
+            frame_time_tensor,
+        )
+
+    def reset(self):
+        self.prev_points_body = None
+        self.prev_return_valid = None
+        self.prev_pos_w = None
+        self.prev_quat_w = None
+        self.last_history_valid = False
+
+    @torch.no_grad()
+    def process_body_points(
+        self,
+        curr_points_body: torch.Tensor,
+        curr_pos_w: Optional[torch.Tensor] = None,
+        curr_quat_w: Optional[torch.Tensor] = None,
+        delta_t: Optional[float] = None,
+        curr_linear_vel_body: Optional[torch.Tensor] = None,
+        curr_point_times: Optional[torch.Tensor] = None,
+        point_linear_vel_body: Optional[torch.Tensor] = None,
+        point_angular_vel_body: Optional[torch.Tensor] = None,
+        curr_frame_time: Optional[Union[float, torch.Tensor]] = None,
+        curr_return_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if curr_pos_w is None or curr_quat_w is None:
+            raise ValueError("curr_pos_w and curr_quat_w at the scan end are required")
+        curr_pos_w = curr_pos_w.to(self.device)
+        curr_quat_w = curr_quat_w.to(self.device)
+        if not bool(torch.isfinite(curr_pos_w).all()) or not bool(torch.isfinite(curr_quat_w).all()):
+            raise ValueError("scan-end pose must be finite")
+        quat_norm = torch.linalg.norm(curr_quat_w, dim=-1)
+        if not bool(torch.allclose(quat_norm, torch.ones_like(quat_norm), atol=1e-3, rtol=1e-3)):
+            raise ValueError("curr_quat_w must be a normalized (w, x, y, z) quaternion")
+        raw_points_body = curr_points_body.to(self.device)
+        curr_points_body = self._deskew_current_frame(
+            raw_points_body,
+            curr_point_times,
+            point_linear_vel_body,
+            point_angular_vel_body,
+            curr_frame_time,
+        )
+        history_valid = self.prev_points_body is not None
+        if not history_valid:
+            prev_aligned = curr_points_body
+        elif self.prev_pos_w is not None and self.prev_quat_w is not None:
+            prev_aligned = align_previous_body_frame(
+                self.prev_points_body,
+                self.prev_pos_w,
+                self.prev_quat_w,
+                curr_pos_w,
+                curr_quat_w,
+            )
+        else:
+            raise RuntimeError("previous frame pose is missing; call reset() and restart the sequence")
+
+        if curr_return_valid is not None:
+            curr_return_valid = curr_return_valid.to(device=self.device, dtype=torch.bool)
+        prev_return_valid = curr_return_valid if not history_valid else self.prev_return_valid
+        model_input = make_network_input(
+            curr_points_body,
+            prev_aligned,
+            self.spec,
+            curr_return_valid=curr_return_valid,
+            prev_return_valid=prev_return_valid,
+        ).to(self.device)
+        if history_valid and delta_t is None:
+            raise ValueError("delta_t is required after the first frame")
+        frame_delta_t = self.reference_delta_t if delta_t is None else float(delta_t)
+        if not self.min_delta_t <= frame_delta_t <= self.max_delta_t:
+            raise ValueError(
+                f"delta_t={frame_delta_t:.6f}s is outside "
+                f"[{self.min_delta_t:.6f}, {self.max_delta_t:.6f}]s"
+            )
+        dt_tensor = torch.full(
+            (model_input.shape[0],),
+            frame_delta_t,
+            device=self.device,
+            dtype=model_input.dtype,
+        )
+        pred = self.model(model_input, dt_tensor)
+        if not history_valid:
+            # With no temporal baseline, expose only the current static range
+            # and a neutral dynamic observation.
+            pred["mask_logits"] = torch.full_like(pred["mask_logits"], -20.0)
+            pred["velocity"] = torch.zeros_like(pred["velocity"])
+        observation_velocity = pred["velocity"]
+        if curr_linear_vel_body is not None:
+            observation_velocity = absolute_to_relative_spherical_velocity(
+                observation_velocity,
+                curr_linear_vel_body.to(self.device),
+                self.spec.vfov_deg,
+            )
+        curr_range_norm = project_points_to_panorama(curr_points_body, self.spec) / self.spec.max_range
+        obs = build_rl_observation(
+            curr_range_norm,
+            pred["mask_logits"],
+            observation_velocity,
+            pred["log_sigma"],
+            dyn_max_vel=self.dyn_max_vel,
+            mask_threshold=self.mask_threshold,
+            dynamic_channels=self.dynamic_channels,
+            output_size=(self.rl_spec.height, self.rl_spec.width),
+        )
+
+        self.prev_points_body = curr_points_body.detach()
+        self.prev_return_valid = None if curr_return_valid is None else curr_return_valid.detach()
+        self.prev_pos_w = curr_pos_w.detach()
+        self.prev_quat_w = curr_quat_w.detach()
+        self.last_history_valid = history_valid
+        valid = torch.full(
+            (curr_points_body.shape[0], 1),
+            history_valid,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        return obs[0], obs[1], valid

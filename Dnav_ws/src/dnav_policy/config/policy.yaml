@@ -1,0 +1,20 @@
+model_file: weights/policy_best.pt
+device: cpu
+fallback_to_cpu: true
+
+perception_topic: /dnav/perception/observation
+odom_topic: /dnav/uav/odom_raw
+goal_topic: /dnav/policy/goal
+output_topic: /dnav/policy/world_velocity
+diagnostics_topic: /dnav/policy/diagnostics
+
+world_frame: map
+body_frame: base_link
+policy_rate: 62.5
+perception_timeout: 0.25
+odometry_timeout: 0.10
+
+action_limit: 3.0
+state_velocity_scale: 3.6
+state_angular_velocity_scale: 6.283185307179586
+state_distance_scale: 33.95585369269929

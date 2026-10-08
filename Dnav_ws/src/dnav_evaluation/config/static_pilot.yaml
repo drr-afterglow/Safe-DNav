@@ -1,0 +1,18 @@
+scenarios:
+  - name: simple_box_crossing
+    world: worlds/simple_box/simple_box_static.world
+    start: [0.0, 0.0, 0.1]
+    yaw: 0.0
+    goal: [6.0, 0.0, 1.0]
+    timeout: 35.2
+    max_horizontal_speed: 0.5
+
+  - name: room_diagonal
+    world: worlds/room/room_static.world
+    start: [-5.0, -5.0, 0.1]
+    yaw: 0.7853981633974483
+    goal: [5.0, 5.0, 1.0]
+    # The 14.14 m straight-line route already needs 28.3 s at the deployed
+    # 0.5 m/s cap; allow measured acceleration, braking, and obstacle detours.
+    timeout: 45.2
+    max_horizontal_speed: 0.5

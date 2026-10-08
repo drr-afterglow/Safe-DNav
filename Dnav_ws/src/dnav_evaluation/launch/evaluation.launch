@@ -1,0 +1,44 @@
+<launch>
+  <arg name="scenario_file" default="$(find dnav_evaluation)/config/empty_smoke.yaml"/>
+  <arg name="scenario_name" default="empty_forward_yaw0"/>
+  <arg name="output_directory" default="/tmp/dnav_evaluation"/>
+  <arg name="run_id" default=""/>
+  <arg name="record_bag" default="false"/>
+  <arg name="world_name" default="$(find dnav_gazebo)/worlds/test/empty.world"/>
+  <arg name="spawn_x" default="0.0"/>
+  <arg name="spawn_y" default="0.0"/>
+  <arg name="spawn_z" default="0.1"/>
+  <arg name="spawn_yaw" default="0.0"/>
+  <arg name="gui" default="false"/>
+  <arg name="perception_device" default="cuda"/>
+  <arg name="controller_config" default="$(find dnav_controller)/config/controller_with_obstacle_safety.yaml"/>
+  <arg name="start_safety_filter" default="true"/>
+  <arg name="safety_filter_config" default="$(find dnav_controller)/config/obstacle_safety.yaml"/>
+
+  <include file="$(find dnav_bringup)/launch/navigation.launch">
+    <arg name="world_name" value="$(arg world_name)"/>
+    <arg name="spawn_x" value="$(arg spawn_x)"/>
+    <arg name="spawn_y" value="$(arg spawn_y)"/>
+    <arg name="spawn_z" value="$(arg spawn_z)"/>
+    <arg name="spawn_yaw" value="$(arg spawn_yaw)"/>
+    <arg name="gazebo_gui" value="$(arg gui)"/>
+    <arg name="perception_device" value="$(arg perception_device)"/>
+    <arg name="controller_config" value="$(arg controller_config)"/>
+    <arg name="start_safety_filter" value="$(arg start_safety_filter)"/>
+    <arg name="safety_filter_config" value="$(arg safety_filter_config)"/>
+  </include>
+
+  <node pkg="dnav_evaluation" type="dnav_episode_runner.py"
+        name="dnav_episode_runner" output="screen" required="true">
+    <param name="scenario_file" value="$(arg scenario_file)"/>
+    <param name="scenario_name" value="$(arg scenario_name)"/>
+    <param name="world_file" value="$(arg world_name)"/>
+    <param name="spawn_x" value="$(arg spawn_x)"/>
+    <param name="spawn_y" value="$(arg spawn_y)"/>
+    <param name="spawn_z" value="$(arg spawn_z)"/>
+    <param name="spawn_yaw" value="$(arg spawn_yaw)"/>
+    <param name="output_directory" value="$(arg output_directory)"/>
+    <param name="run_id" value="$(arg run_id)"/>
+    <param name="record_bag" value="$(arg record_bag)"/>
+  </node>
+</launch>

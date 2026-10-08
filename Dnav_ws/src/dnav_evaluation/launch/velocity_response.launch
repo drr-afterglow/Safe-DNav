@@ -1,0 +1,27 @@
+<launch>
+  <arg name="output_directory" default="/tmp/dnav_velocity_response"/>
+  <arg name="run_id" default="production"/>
+  <arg name="controller_config" default="$(find dnav_controller)/config/controller.yaml"/>
+  <arg name="world_name" default="$(find dnav_gazebo)/worlds/test/empty.world"/>
+  <arg name="gui" default="false"/>
+
+  <include file="$(find dnav_bringup)/launch/navigation.launch">
+    <arg name="start_perception" value="false"/>
+    <arg name="start_policy" value="false"/>
+    <arg name="start_safety_filter" value="false"/>
+    <arg name="controller_config" value="$(arg controller_config)"/>
+    <arg name="world_name" value="$(arg world_name)"/>
+    <arg name="spawn_x" value="0.0"/>
+    <arg name="spawn_y" value="0.0"/>
+    <arg name="spawn_z" value="0.1"/>
+    <arg name="spawn_yaw" value="0.0"/>
+    <arg name="gazebo_gui" value="$(arg gui)"/>
+  </include>
+
+  <node pkg="dnav_evaluation" type="dnav_velocity_response.py"
+        name="dnav_velocity_response" output="screen" required="true">
+    <param name="output_directory" value="$(arg output_directory)"/>
+    <param name="run_id" value="$(arg run_id)"/>
+    <param name="controller_config" value="$(arg controller_config)"/>
+  </node>
+</launch>

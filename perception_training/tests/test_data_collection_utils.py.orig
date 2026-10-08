@@ -1,0 +1,175 @@
+import pytest
+import torch
+
+from perception_training.data_collection.collect import filter_samples, limit_batch_size, summarize_batch
+from perception_training.data_collection.raycast import (
+    dynamic_sphere_positions_at_rays,
+    generate_mid360_nonrepetitive_pattern,
+    scan_ray_poses,
+    sphere_lidar_hits,
+)
+from perception_training.data_collection.writer import ShardWriter
+from perception_training.dataset import LidarPairDataset, split_dataset
+from perception_training.geometry import PanoramaSpec, project_points_to_panorama
+
+
+def _batch():
+    batch = {
+        "input": torch.zeros(4, 2, 16, 180),
+        "mask": torch.zeros(4, 1, 16, 180),
+        "velocity": torch.zeros(4, 3, 16, 180),
+        "valid": torch.ones(4, 1, 16, 180),
+        "delta_t": torch.full((4,), 0.096),
+        "ego_translation_m": torch.tensor([0.0, 0.1, 0.2, 0.3]),
+        "ego_rotation_deg": torch.tensor([0.0, 1.0, 2.0, 3.0]),
+        "ego_velocity_body_mps": torch.tensor(
+            [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0], [1.0, 2.0, 2.0]]
+        ),
+    }
+    batch["mask"][1, :, 0, 0] = 1.0
+    batch["mask"][2, :, 0, :2] = 1.0
+    batch["velocity"][2, :, 0, 0] = torch.tensor([1.0, 2.0, 2.0])
+    return batch
+
+
+def test_filter_samples_keeps_dynamic_threshold():
+    filtered = filter_samples(_batch(), min_dynamic_pixels=2, keep_empty_ratio=0.0)
+    assert filtered is not None
+    assert filtered["input"].shape[0] == 1
+    assert filtered["mask"].sum() == 2
+
+
+def test_limit_and_summary_and_manifest(tmp_path):
+    batch = _batch()
+    stats = summarize_batch(batch)
+    assert stats["batch"] == 4
+    assert stats["dyn_samples"] == 2
+    assert stats["dyn_pixels_max"] == 2
+    assert stats["ego_translation_m"] == pytest.approx(0.15)
+
+    limited = limit_batch_size(batch, 2)
+    writer = ShardWriter(tmp_path, shard_size=1, overwrite=True)
+    writer.add_batch(limited)
+    writer.write_manifest({"collection": {"num_samples": 2}}, {"kept_samples": 2})
+    assert writer.num_samples == 2
+    assert (tmp_path / "manifest.yaml").exists()
+    reloaded = LidarPairDataset([str(tmp_path)])
+    torch.testing.assert_close(
+        reloaded[0]["ego_velocity_body_mps"], torch.tensor([1.0, 0.0, 0.0])
+    )
+
+
+def test_mid360_pattern_is_full_fov_temporal_and_nonrepeating():
+    phase = torch.tensor([[0.17, 0.43], [0.31, 0.79]])
+    directions0, offsets0 = generate_mid360_nonrepetitive_pattern(
+        num_envs=2,
+        points_per_frame=5760,
+        vfov_deg=(-7.0, 52.0),
+        scan_duration=0.096,
+        frame_index=0,
+        phase=phase,
+        device="cpu",
+    )
+    directions1, offsets1 = generate_mid360_nonrepetitive_pattern(
+        num_envs=2,
+        points_per_frame=5760,
+        vfov_deg=(-7.0, 52.0),
+        scan_duration=0.096,
+        frame_index=1,
+        phase=phase,
+        device="cpu",
+    )
+    assert directions0.shape == (2, 5760, 3)
+    torch.testing.assert_close(torch.linalg.norm(directions0, dim=-1), torch.ones(2, 5760))
+    assert not torch.allclose(directions0, directions1)
+    assert offsets0.min() >= -0.096
+    assert offsets0.max() <= 0.0
+    torch.testing.assert_close(offsets0, offsets1)
+
+    spec = PanoramaSpec(height=16, width=180, max_range=10.0, vfov_deg=(-7.0, 52.0))
+    panorama = project_points_to_panorama(directions0[0:1] * 5.0, spec)
+    coverage = (panorama < spec.max_range).float().mean()
+    assert coverage > 0.90
+
+
+
+def test_scan_ray_poses_static_world_moving_sensor():
+    offsets = torch.tensor([[-0.1, -0.05, 0.0]])
+    pos, quat = scan_ray_poses(
+        end_pos_w=torch.tensor([[1.0, 0.0, 0.0]]),
+        end_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        end_linear_vel_w=torch.tensor([[2.0, 0.0, 0.0]]),
+        linear_accel_w=torch.zeros(1, 3),
+        end_angular_vel_body=torch.tensor([[0.0, 0.0, 1.0]]),
+        angular_accel_body=torch.zeros(1, 3),
+        point_time_offsets=offsets,
+    )
+    torch.testing.assert_close(pos[0, :, 0], torch.tensor([0.8, 0.9, 1.0]))
+    torch.testing.assert_close(pos[0, :, 1:], torch.zeros(3, 2))
+    torch.testing.assert_close(quat[0, -1], torch.tensor([1.0, 0.0, 0.0, 0.0]))
+    expected_first = torch.tensor(
+        [torch.cos(torch.tensor(0.05)), 0.0, 0.0, -torch.sin(torch.tensor(0.05))]
+    )
+    torch.testing.assert_close(quat[0, 0], expected_first)
+
+
+def test_dynamic_sphere_positions_follow_ray_timestamps():
+    offsets = torch.tensor([[-0.1, 0.0]])
+    positions = dynamic_sphere_positions_at_rays(
+        torch.tensor([[5.0, 1.0, 0.0]]),
+        torch.tensor([[2.0, -1.0, 0.0]]),
+        offsets,
+    )
+    torch.testing.assert_close(positions[0, 0, 0], torch.tensor([4.8, 1.1, 0.0]))
+    torch.testing.assert_close(positions[0, 1, 0], torch.tensor([5.0, 1.0, 0.0]))
+
+
+def test_combined_sensor_and_sphere_motion_changes_each_intersection():
+    offsets = torch.tensor([[-0.1, 0.0]])
+    ray_origins, _ = scan_ray_poses(
+        end_pos_w=torch.tensor([[1.0, 0.0, 0.0]]),
+        end_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        end_linear_vel_w=torch.tensor([[1.0, 0.0, 0.0]]),
+        linear_accel_w=torch.zeros(1, 3),
+        end_angular_vel_body=torch.zeros(1, 3),
+        angular_accel_body=torch.zeros(1, 3),
+        point_time_offsets=offsets,
+    )
+    sphere_positions = dynamic_sphere_positions_at_rays(
+        torch.tensor([[6.0, 0.0, 0.0]]),
+        torch.tensor([[-1.0, 0.0, 0.0]]),
+        offsets,
+    )
+    hits, mask, _ = sphere_lidar_hits(
+        10.0,
+        sphere_positions,
+        torch.tensor([1.0]),
+        ray_origins,
+        torch.tensor([[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]),
+    )
+    assert mask.all()
+    torch.testing.assert_close(hits[0, :, 0], torch.tensor([5.1, 5.0]))
+    torch.testing.assert_close(hits[0, :, 1:], torch.zeros(2, 2))
+
+def test_dataset_split_keeps_scenes_disjoint(tmp_path):
+    samples = []
+    for scene_id in (10, 20, 30):
+        for _ in range(2):
+            samples.append(
+                {
+                    "input": torch.ones(2, 16, 180),
+                    "mask": torch.zeros(1, 16, 180),
+                    "velocity": torch.zeros(3, 16, 180),
+                    "delta_t": torch.tensor(0.096),
+                    "scene_id": torch.tensor(scene_id),
+                }
+            )
+    torch.save(samples, tmp_path / "scenes.pt")
+    dataset = LidarPairDataset([str(tmp_path)])
+    train_set, val_set = split_dataset(dataset, val_ratio=0.34, seed=0)
+    train_scenes = {int(dataset[idx]["scene_id"]) for idx in train_set.indices}
+    val_scenes = {int(dataset[idx]["scene_id"]) for idx in val_set.indices}
+    assert train_scenes
+    assert val_scenes
+    assert train_scenes.isdisjoint(val_scenes)
+    assert dataset[0]["input"].shape == (4, 16, 180)

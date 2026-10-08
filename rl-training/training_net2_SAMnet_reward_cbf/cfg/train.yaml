@@ -1,0 +1,90 @@
+defaults:
+  - _self_
+  - drone
+  - ppo
+  - sim
+
+headless: true
+device: "cuda:0"
+isaac_asset_root: "/root/autodl-tmp/NavRL_isaac_assets"
+seed: 0
+
+max_frame_num: 4e6
+eval_interval: 50
+eval_seeds: [0, 1, 2]
+early_stop_patience: 3
+early_stop_min_delta: 0.003
+collision_score_weight: 0.0
+static_collision_score_weight: 1.5
+dynamic_collision_score_weight: 1.0
+boundary_score_weight: 0.5
+save_interval: 50
+
+env:
+  num_envs: 512
+  max_episode_length: 2200
+  env_spacing: 0.0
+  num_obstacles: 200
+  collision_penalty: -100.0
+  safety_reward_weight: 1.2
+  static_safety_reward_weight: 0.0
+  dynamic_safety_reward_weight: 0.0
+  static_dense_safety_reward_weight: 0.15
+  static_dense_margin_m: 1.5
+  static_dense_topk: 8
+  static_collision_extra_penalty: 0.0
+  dynamic_collision_extra_penalty: 0.0
+
+env_dyn:
+  num_obstacles: 60
+  vel_range: [0.5, 1.0]
+
+viewer:
+  eye: [0.0, -55.0, 22.0]
+  lookat: [0.0, 0.0, 1.5]
+  resolution: [1280, 720]
+
+wandb:
+  project: "FLA_RL-dyn(cbf)"
+  name: "saumnet_proxy5ch_dense_static_short_finetune"
+  entity: "rongrongdeng862-jilin-university"
+  dir: "/root/autodl-tmp/NavRL_runs"
+  mode: "online"
+  run_id: null
+
+# A new five-channel policy must be trained from scratch.  Three-channel
+# checkpoints are incompatible with this observation encoder.
+resume_optimizer: false
+resume_cbf_lambda: true
+
+checkpoint: /root/autodl-tmp/NavRL_runs/wandb/run-20260806_111947-9ikdyyw3/files/checkpoint_750.pt
+
+# Introduce dynamic motion gradually.  Every phase contains all fields consumed
+# by NavigationEnv.update_curriculum.
+curriculum:
+  enabled: false
+  phases:
+    - frame: 0
+      active_dyn_obs: 0
+      dyn_vel_range: [0.2, 0.5]
+      vel_min: 0.2
+      vel_max: 1.0
+
+    - frame: 2.0e7
+      active_dyn_obs: 15
+      dyn_vel_range: [0.2, 0.5]
+      vel_min: 0.2
+      vel_max: 1.5
+
+    - frame: 5.0e7
+      active_dyn_obs: 40
+      dyn_vel_range: [0.3, 0.8]
+      vel_min: 0.2
+      vel_max: 2.2
+
+    - frame: 1.0e8
+      active_dyn_obs: 60
+      dyn_vel_range: [0.5, 1.0]
+      vel_min: 0.2
+      vel_max: 3.0
+

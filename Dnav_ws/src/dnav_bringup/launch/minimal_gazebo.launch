@@ -1,0 +1,1 @@
+<launch><include file="$(find dnav_gazebo)/launch/start.launch"/></launch>

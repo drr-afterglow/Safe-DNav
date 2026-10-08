@@ -1,0 +1,3 @@
+8c164084323a4077ef7f700c24cb7ef2bd50178d5b2ac1f7687bca4871a23399  Dnav_ws/weights/perception_best.ts.pt
+8c164084323a4077ef7f700c24cb7ef2bd50178d5b2ac1f7687bca4871a23399  Dnav_ws/src/dnav_perception/models/perception_best.ts.pt
+834affd0ecaebbe966254ef64ef322cea4ce5c241672a9dfe4de650c763fb8a0  Dnav_ws/weights/policy_best.pt

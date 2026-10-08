@@ -1,0 +1,66 @@
+filter_rate: 50.0
+policy_topic: /dnav/policy/world_velocity
+goal_topic: /dnav/policy/goal
+odometry_topic: /dnav/uav/odom_raw
+scan_topic: /dnav/uav/mid360/scan
+perception_topic: /dnav/perception/observation
+output_topic: /dnav/safety/world_velocity
+diagnostics_topic: /dnav/safety/diagnostics
+world_frame: map
+body_frame: base_link
+sensor_frame: mid360_link
+policy_timeout: 0.25
+odometry_timeout: 0.10
+scan_timeout: 0.20
+perception_timeout: 0.25
+future_stamp_tolerance: 0.05
+scan_height: 16
+scan_width: 360
+vertical_min_deg: -7.0
+vertical_max_deg: 52.0
+vehicle_radius: 0.30
+# An unclassified mover still appears in the raw scan. Keep enough base margin
+# for braking and lateral response when the dynamic segmentation drops out.
+safety_margin: 0.50
+# The training CBF uses 0.90 m. Deployment adds 0.30 m measured lateral
+# response distance, giving a 1.20 m total boundary with the vehicle radius.
+dynamic_safety_margin: 0.90
+effective_deceleration: 0.25
+latency_budget: 0.15
+min_obstacle_z: -0.45
+max_obstacle_z: 0.25
+max_obstacle_range: 4.0
+# The trained actor supports commands up to 3.0 m/s. Keep the deployment
+# envelope conservative while allowing enough lateral authority to evade
+# crossing pedestrians.
+max_horizontal_speed: 0.5
+escape_speed_threshold: 0.05
+dynamic_max_range: 10.0
+dynamic_velocity_scale: 5.0
+dynamic_uncertainty_scale: 10.0
+dynamic_valid_depth_threshold: 0.99
+# Use training-time 2-sigma uncertainty to trigger the braking envelope early.
+# The hard retreat half-plane still uses nominal obstacle velocity, so this
+# cannot demand a speed outside the vehicle envelope.
+dynamic_confidence_scale: 2.0
+dynamic_uncertainty_velocity_cap: 0.30
+# Use the ROS1 shield's velocity-obstacle formulation for moving targets.
+use_orca_for_dynamic: true
+orca_time_horizon: 2.0
+orca_time_step: 0.05
+orca_safety_distance: 0.30
+dynamic_obstacle_radius: 0.45
+dynamic_lateral_escape_speed: 0.35
+dynamic_cluster_minimum_pixels: 2
+dynamic_cluster_depth_tolerance: 0.75
+# Reconnect parts of one pedestrian split by missed pixels/depth edges. The
+# training curriculum and this evaluation stage contain at most three movers.
+dynamic_cluster_merge_distance: 1.0
+dynamic_maximum_clusters: 3
+# Bridge short segmentation dropouts without simulator ground truth. Tracks
+# are associated in the body panorama and propagated by measured radial speed.
+dynamic_track_association_distance: 1.0
+dynamic_track_hold_time: 0.60
+dynamic_track_update_alpha: 0.25
+dynamic_min_absolute_speed: 0.15
+dynamic_max_absolute_speed: 3.0

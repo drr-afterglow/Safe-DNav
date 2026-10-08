@@ -1,0 +1,585 @@
+import time
+
+import numpy as np
+import torch
+from tensordict.tensordict import TensorDict, TensorDictBase
+from torchrl.data import CompositeSpec, DiscreteTensorSpec, UnboundedContinuousTensorSpec
+
+import omni.isaac.core.utils.nucleus as nucleus_utils
+import omni.isaac.core.utils.prims as prim_utils
+
+# Orbit package imports pull in modules that query Omniverse Nucleus at import
+# time. Offline perception-data collection only uses local procedural geometry,
+# so provide a local asset-root placeholder to avoid long server timeouts.
+nucleus_utils.get_assets_root_path = lambda: "/tmp/isaac_assets"
+
+from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
+from omni.isaac.orbit.terrains import HfDiscreteObstaclesTerrainCfg, TerrainGeneratorCfg, TerrainImporter, TerrainImporterCfg
+from omni.isaac.orbit.utils.warp import raycast_mesh
+from omni_drones.envs.isaac_env import AgentSpec, IsaacEnv
+from omni_drones.robots.drone import MultirotorBase
+from omni_drones.utils.torch import euler_to_quaternion, quat_rotate
+
+from perception_training.data_collection.raycast import (
+    dynamic_sphere_positions_at_rays,
+    generate_mid360_nonrepetitive_pattern,
+    scan_ray_poses,
+    sphere_lidar_hits,
+)
+from perception_training.perception_training.isaac_labels import (
+    build_supervised_batch_from_isaac,
+    merge_hits_by_nearest,
+    validate_supervised_batch,
+)
+from perception_training.perception_training.geometry import PanoramaSpec, integrate_body_angular_velocity
+
+
+class PerceptionDataCollectionEnv(IsaacEnv):
+    def __init__(self, cfg):
+        self.lidar_range = float(cfg.sensor.lidar_range)
+        self.lidar_min_range = float(cfg.sensor.get("min_range", 0.1))
+        sampling_cfg = cfg.sensor.sampling
+        self.scan_points_per_frame = int(sampling_cfg.simulated_points_per_frame)
+        self.scan_duration = float(sampling_cfg.scan_duration)
+        self.nominal_point_rate_hz = int(sampling_cfg.nominal_point_rate_hz)
+        self.nominal_points_per_frame = int(round(self.nominal_point_rate_hz * self.scan_duration))
+        self.return_dropout_prob = float(sampling_cfg.get("return_dropout_prob", 0.0))
+        self.range_noise_std_m = float(sampling_cfg.get("range_noise_std_m", 0.0))
+        if str(sampling_cfg.profile) != "mid360_nonrepetitive_approx":
+            raise ValueError(f"Unsupported MID-360 sampling profile: {sampling_cfg.profile}")
+        if self.scan_points_per_frame <= 0 or self.nominal_point_rate_hz <= 0 or self.scan_duration <= 0:
+            raise ValueError("MID-360 point rate, scan duration and simulated point count must be positive")
+        if not 0.0 <= self.return_dropout_prob < 1.0:
+            raise ValueError("return_dropout_prob must be in [0, 1)")
+        if self.range_noise_std_m < 0:
+            raise ValueError("range_noise_std_m must be non-negative")
+        proxy_cfg = cfg.sensor.raycast_proxy
+        self.raw_hbeams = int(proxy_cfg.horizontal_beams)
+        self.raw_vertical_angles = list(proxy_cfg.vertical_angles_deg)
+        proxy_num_rays = self.raw_hbeams * len(self.raw_vertical_angles)
+        if proxy_num_rays != self.scan_points_per_frame:
+            raise ValueError(
+                "sensor.raycast_proxy must allocate exactly "
+                "sensor.sampling.simulated_points_per_frame rays"
+            )
+        self.panorama_spec = PanoramaSpec(
+            height=int(getattr(cfg.sensor, "network_panorama_height", getattr(cfg.sensor, "panorama_height", 16))),
+            width=int(getattr(cfg.sensor, "network_panorama_width", getattr(cfg.sensor, "panorama_width", 180))),
+            max_range=float(cfg.sensor.lidar_range),
+            vfov_deg=tuple(cfg.sensor.vfov_deg),
+        )
+        self.map_range = list(cfg.env.map_range)
+        self.dyn_vel_range = list(cfg.env_dyn.vel_range)
+        self.dyn_max_accel = float(cfg.env_dyn.get("max_accel", 2.0))
+        self.active_dyn_obs = int(cfg.env_dyn.num_obstacles)
+        motion_cfg = cfg.collection.sensor_motion
+        self.sensor_motion_enabled = bool(motion_cfg.enabled)
+        self.sensor_static_ratio = float(motion_cfg.static_ratio)
+        self.sensor_speed_range = tuple(float(v) for v in motion_cfg.linear_speed_range)
+        self.sensor_angular_rate_range = tuple(float(v) * torch.pi / 180.0 for v in motion_cfg.angular_rate_deg_s)
+        self.sensor_accel_range = tuple(float(v) for v in motion_cfg.linear_accel_range)
+        self.sensor_angular_accel_range = tuple(
+            float(v) * torch.pi / 180.0 for v in motion_cfg.angular_accel_deg_s2
+        )
+        alignment_cfg = cfg.collection.alignment_noise
+        self.alignment_position_std_m = float(alignment_cfg.position_std_m)
+        self.alignment_rotation_std_rad = float(alignment_cfg.rotation_std_deg) * torch.pi / 180.0
+        self.prev_vel_w = None
+        super().__init__(cfg, cfg.headless)
+
+        self.drone.initialize()
+
+        horizontal_res = 360.0 / self.raw_hbeams
+        ray_caster_cfg = RayCasterCfg(
+            prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
+            attach_yaw_only=False,
+            pattern_cfg=patterns.BpearlPatternCfg(
+                horizontal_res=horizontal_res,
+                vertical_ray_angles=torch.tensor(self.raw_vertical_angles, device=self.device),
+            ),
+            debug_vis=False,
+            mesh_prim_paths=["/World/ground"],
+        )
+        self.lidar = RayCaster(ray_caster_cfg)
+        self.lidar._initialize_impl()
+        env_index = torch.arange(self.num_envs, device=self.device, dtype=torch.float32)
+        self.scan_phase = torch.stack(
+            [
+                torch.remainder(env_index * 0.41421356237 + 0.17, 1.0),
+                torch.remainder(env_index * 0.73205080757 + 0.43, 1.0),
+            ],
+            dim=-1,
+        )
+        self.scan_frame_index = 0
+        self.ray_dirs_body = self.lidar.ray_directions
+        self.num_rays = self.ray_dirs_body.shape[1]
+        self.randomize_sensor_poses(torch.arange(self.num_envs, device=self.device))
+
+    def _design_scene(self):
+        drone_model = MultirotorBase.REGISTRY[self.cfg.drone.model_name]
+        drone_cfg = drone_model.cfg_cls(force_sensor=False)
+        self.drone = drone_model(cfg=drone_cfg)
+        self.drone.spawn(translations=[(0.0, 0.0, 2.0)])
+
+        prim_utils.create_prim("/World/light", "DistantLight")
+        prim_utils.create_prim("/World/skyLight", "DomeLight")
+
+        terrain_cfg = TerrainImporterCfg(
+            num_envs=self.num_envs,
+            env_spacing=0.0,
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=TerrainGeneratorCfg(
+                seed=int(self.cfg.env.static_seed),
+                size=(self.map_range[0] * 2.0, self.map_range[1] * 2.0),
+                border_width=5.0,
+                num_rows=1,
+                num_cols=1,
+                horizontal_scale=0.1,
+                vertical_scale=0.1,
+                slope_threshold=0.75,
+                use_cache=False,
+                color_scheme="none",
+                sub_terrains={
+                    "obstacles": HfDiscreteObstaclesTerrainCfg(
+                        horizontal_scale=0.1,
+                        vertical_scale=0.1,
+                        border_width=0.0,
+                        num_obstacles=int(self.cfg.env.num_static_obstacles),
+                        obstacle_height_mode="range",
+                        obstacle_width_range=tuple(self.cfg.env.static_width_range),
+                        obstacle_height_range=list(self.cfg.env.static_height_range),
+                        obstacle_height_probability=list(self.cfg.env.static_height_probability),
+                        platform_width=0.0,
+                    ),
+                },
+            ),
+            visual_material=None,
+            max_init_terrain_level=None,
+            collision_group=-1,
+            debug_vis=bool(self.cfg.env.debug_vis),
+        )
+        TerrainImporter(terrain_cfg)
+        self._spawn_dynamic_obstacles()
+        return ["/World/ground"]
+
+    def _spawn_dynamic_obstacles(self):
+        num_obs = int(self.cfg.env_dyn.num_obstacles)
+        self.dyn_obs_list = []
+        self.dyn_obs_state = torch.zeros((num_obs, 13), dtype=torch.float32, device=self.device)
+        self.dyn_obs_state[:, 3] = 1.0
+        self.dyn_obs_goal = torch.zeros((num_obs, 3), dtype=torch.float32, device=self.device)
+        self.dyn_obs_origin = torch.zeros((num_obs, 3), dtype=torch.float32, device=self.device)
+        self.dyn_obs_vel = torch.zeros((num_obs, 3), dtype=torch.float32, device=self.device)
+        self.dyn_obs_accel = torch.zeros((num_obs, 3), dtype=torch.float32, device=self.device)
+        self.dyn_obs_size = torch.zeros((num_obs, 3), dtype=torch.float32, device=self.device)
+        self.dyn_obs_step_count = 0
+        self.current_speed_norms = torch.zeros((num_obs, 1), dtype=torch.float32, device=self.device)
+        if num_obs == 0:
+            return
+
+        r_min, r_max = self.cfg.env_dyn.size_range
+        prev_pos = []
+        prev_radius = []
+        for idx in range(num_obs):
+            radius = np.random.uniform(float(r_min), float(r_max))
+            start_time = time.time()
+            while True:
+                pos = np.array(
+                    [
+                        np.random.uniform(-self.map_range[0], self.map_range[0]),
+                        np.random.uniform(-self.map_range[1], self.map_range[1]),
+                        np.random.uniform(0.8, self.map_range[2]),
+                    ]
+                )
+                valid = True
+                for other_pos, other_radius in zip(prev_pos, prev_radius):
+                    if np.linalg.norm(pos - other_pos) <= radius + other_radius + 0.8:
+                        valid = False
+                        break
+                if valid or time.time() - start_time > 0.2:
+                    prev_pos.append(pos)
+                    prev_radius.append(radius)
+                    break
+            self.dyn_obs_origin[idx] = torch.tensor(pos, dtype=torch.float32, device=self.device)
+            self.dyn_obs_state[idx, :3] = self.dyn_obs_origin[idx]
+            self.dyn_obs_size[idx] = torch.tensor([radius, radius, radius], dtype=torch.float32, device=self.device)
+
+    def _set_specs(self):
+        self.observation_spec = CompositeSpec(
+            {"dummy": UnboundedContinuousTensorSpec((1,), device=self.device)}
+        ).expand(self.num_envs).to(self.device)
+        self.action_spec = CompositeSpec(
+            {"dummy": UnboundedContinuousTensorSpec((1,), device=self.device)}
+        ).expand(self.num_envs).to(self.device)
+        self.reward_spec = CompositeSpec(
+            {"reward": UnboundedContinuousTensorSpec((1,), device=self.device)}
+        ).expand(self.num_envs).to(self.device)
+        self.done_spec = CompositeSpec(
+            {
+                "done": DiscreteTensorSpec(2, (1,), dtype=torch.bool, device=self.device),
+                "terminated": DiscreteTensorSpec(2, (1,), dtype=torch.bool, device=self.device),
+                "truncated": DiscreteTensorSpec(2, (1,), dtype=torch.bool, device=self.device),
+            }
+        ).expand(self.num_envs).to(self.device)
+        self.agent_spec["drone"] = AgentSpec(
+            "drone",
+            1,
+            observation_key="dummy",
+            action_key="dummy",
+            reward_key="reward",
+        )
+
+    def _reset_idx(self, env_ids: torch.Tensor):
+        self.randomize_sensor_poses(env_ids)
+
+    def _pre_sim_step(self, tensordict: TensorDictBase):
+        self.move_dynamic_obstacles()
+
+    def _post_sim_step(self, tensordict: TensorDictBase):
+        self.lidar.update(self.dt)
+
+    def _compute_state_and_obs(self):
+        return TensorDict({"dummy": torch.zeros(self.num_envs, 1, device=self.device)}, self.batch_size)
+
+    def _compute_reward_and_done(self):
+        zeros = torch.zeros(self.num_envs, 1, device=self.device, dtype=torch.bool)
+        return TensorDict(
+            {
+                "reward": torch.zeros(self.num_envs, 1, device=self.device),
+                "done": zeros,
+                "terminated": zeros,
+                "truncated": zeros,
+            },
+            self.batch_size,
+        )
+
+    def randomize_sensor_poses(self, env_ids: torch.Tensor):
+        num = env_ids.numel()
+        x = (torch.rand(num, device=self.device) * 2.0 - 1.0) * float(self.cfg.collection.pose_xy_range[0])
+        y = (torch.rand(num, device=self.device) * 2.0 - 1.0) * float(self.cfg.collection.pose_xy_range[1])
+        z_min, z_max = self.cfg.collection.pose_z_range
+        z = torch.rand(num, device=self.device) * (float(z_max) - float(z_min)) + float(z_min)
+        pos = torch.stack([x, y, z], dim=-1).unsqueeze(1)
+        rpy = torch.zeros(num, 1, 3, device=self.device)
+        rpy[..., 2] = (torch.rand(num, 1, device=self.device) * 2.0 - 1.0) * torch.pi
+        if bool(self.cfg.collection.randomize_roll_pitch):
+            max_rp = float(self.cfg.collection.max_roll_pitch_deg) * torch.pi / 180.0
+            rpy[..., 0:2] = (torch.rand(num, 1, 2, device=self.device) * 2.0 - 1.0) * max_rp
+        quat = euler_to_quaternion(rpy)
+        self.drone.set_world_poses(pos, quat, env_ids)
+        self.drone.set_velocities(torch.zeros(num, 6, device=self.device), env_ids)
+        if not hasattr(self, "sensor_pos_w"):
+            self.sensor_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+            self.sensor_quat_w = torch.zeros(self.num_envs, 4, device=self.device)
+            self.sensor_quat_w[:, 0] = 1.0
+            self.sensor_linear_vel_w = torch.zeros(self.num_envs, 3, device=self.device)
+            self.sensor_angular_vel_body = torch.zeros(self.num_envs, 3, device=self.device)
+            self.sensor_linear_accel_w = torch.zeros(self.num_envs, 3, device=self.device)
+            self.sensor_angular_accel_body = torch.zeros(self.num_envs, 3, device=self.device)
+        self.sensor_pos_w[env_ids] = pos[:, 0]
+        self.sensor_quat_w[env_ids] = quat[:, 0]
+        self.sensor_linear_vel_w[env_ids] = 0.0
+        self.sensor_angular_vel_body[env_ids] = 0.0
+        self.sensor_linear_accel_w[env_ids] = 0.0
+        self.sensor_angular_accel_body[env_ids] = 0.0
+
+    def _sample_vector_with_norm(self, count, value_range):
+        direction = torch.randn(count, 3, device=self.device)
+        direction = direction / torch.linalg.norm(direction, dim=-1, keepdim=True).clamp_min(1e-6)
+        magnitude = torch.rand(count, 1, device=self.device) * (value_range[1] - value_range[0]) + value_range[0]
+        return direction * magnitude
+
+    def sample_sensor_motion(self):
+        """Sample one short 6-DoF motion segment for every supervised pair."""
+        if not self.sensor_motion_enabled:
+            self.sensor_linear_vel_w.zero_()
+            self.sensor_angular_vel_body.zero_()
+            self.sensor_linear_accel_w.zero_()
+            self.sensor_angular_accel_body.zero_()
+        else:
+            count = self.num_envs
+            moving = (torch.rand(count, 1, device=self.device) >= self.sensor_static_ratio).float()
+            self.sensor_linear_vel_w = self._sample_vector_with_norm(count, self.sensor_speed_range) * moving
+            self.sensor_angular_vel_body = self._sample_vector_with_norm(
+                count, self.sensor_angular_rate_range
+            ) * moving
+            self.sensor_linear_accel_w = self._sample_vector_with_norm(count, self.sensor_accel_range) * moving
+            self.sensor_angular_accel_body = self._sample_vector_with_norm(
+                count, self.sensor_angular_accel_range
+            ) * moving
+        angular_vel_w = quat_rotate(self.sensor_quat_w, self.sensor_angular_vel_body)
+        self.drone.set_velocities(torch.cat([self.sensor_linear_vel_w, angular_vel_w], dim=-1))
+
+    def advance_sensor_motion(self, dt: float):
+        if not self.sensor_motion_enabled:
+            return
+        dt = float(dt)
+        self.sensor_pos_w += self.sensor_linear_vel_w * dt + 0.5 * self.sensor_linear_accel_w * dt * dt
+        self.sensor_linear_vel_w += self.sensor_linear_accel_w * dt
+        self.sensor_quat_w = integrate_body_angular_velocity(
+            self.sensor_quat_w,
+            self.sensor_angular_vel_body,
+            dt,
+        )
+        self.sensor_angular_vel_body += self.sensor_angular_accel_body * dt
+
+        # Initial poses leave a safety margin, but clamp rare accelerated
+        # excursions so all ray origins remain inside the generated map.
+        self.sensor_pos_w[:, 0] = self.sensor_pos_w[:, 0].clamp(-self.map_range[0], self.map_range[0])
+        self.sensor_pos_w[:, 1] = self.sensor_pos_w[:, 1].clamp(-self.map_range[1], self.map_range[1])
+        self.sensor_pos_w[:, 2] = self.sensor_pos_w[:, 2].clamp(0.3, self.map_range[2])
+        self.drone.set_world_poses(self.sensor_pos_w.unsqueeze(1), self.sensor_quat_w.unsqueeze(1))
+        angular_vel_w = quat_rotate(self.sensor_quat_w, self.sensor_angular_vel_body)
+        self.drone.set_velocities(torch.cat([self.sensor_linear_vel_w, angular_vel_w], dim=-1))
+
+    def move_dynamic_obstacles(self):
+        if self.dyn_obs_state.shape[0] == 0:
+            return
+        dist_to_goal = torch.linalg.norm(self.dyn_obs_state[:, :3] - self.dyn_obs_goal, dim=1)
+        need_new_goal = (dist_to_goal < 0.5) | (self.dyn_obs_step_count == 0)
+        if need_new_goal.any():
+            local_xy, local_z = self.cfg.env_dyn.local_range
+            offset = torch.rand(int(need_new_goal.sum()), 3, device=self.device) * 2.0 - 1.0
+            offset[:, 0] *= float(local_xy)
+            offset[:, 1] *= float(local_xy)
+            offset[:, 2] *= float(local_z)
+            goals = self.dyn_obs_origin[need_new_goal] + offset
+            goals[:, 0] = goals[:, 0].clamp(-self.map_range[0], self.map_range[0])
+            goals[:, 1] = goals[:, 1].clamp(-self.map_range[1], self.map_range[1])
+            goals[:, 2] = goals[:, 2].clamp(0.5, self.map_range[2])
+            self.dyn_obs_goal[need_new_goal] = goals
+
+        if self.dyn_obs_step_count % max(int(2.0 / self.cfg.sim.dt), 1) == 0:
+            v_min, v_max = self.dyn_vel_range
+            self.current_speed_norms = torch.rand(self.dyn_obs_state.shape[0], 1, device=self.device) * (
+                float(v_max) - float(v_min)
+            ) + float(v_min)
+
+        direction = self.dyn_obs_goal - self.dyn_obs_state[:, :3]
+        direction = direction / torch.linalg.norm(direction, dim=1, keepdim=True).clamp_min(1e-6)
+        desired_velocity = self.current_speed_norms * direction
+        velocity_delta = desired_velocity - self.dyn_obs_vel
+        max_delta = self.dyn_max_accel * float(self.cfg.sim.dt)
+        delta_norm = torch.linalg.norm(velocity_delta, dim=1, keepdim=True)
+        velocity_delta = velocity_delta * (max_delta / delta_norm.clamp_min(max_delta)).clamp(max=1.0)
+        n_active = min(self.active_dyn_obs, self.dyn_obs_vel.shape[0])
+        if n_active < self.dyn_obs_vel.shape[0]:
+            velocity_delta[n_active:] = -self.dyn_obs_vel[n_active:]
+        step_dt = float(self.cfg.sim.dt)
+        self.dyn_obs_accel = velocity_delta / step_dt
+        self.dyn_obs_vel += velocity_delta
+        self.dyn_obs_state[:, :3] += self.dyn_obs_vel * float(self.cfg.sim.dt)
+        self.dyn_obs_state[:, 2] = self.dyn_obs_state[:, 2].clamp(0.5, self.map_range[2])
+        self.dyn_obs_state[:, 7:10] = self.dyn_obs_vel
+        self.dyn_obs_step_count += 1
+
+    def _static_hits_clamped(self, lidar_pos_w, ray_dirs_w):
+        ray_starts_w = (
+            lidar_pos_w if lidar_pos_w.ndim == 3 else lidar_pos_w.unsqueeze(1).expand_as(ray_dirs_w)
+        ).contiguous()
+        hits_w = raycast_mesh(
+            ray_starts_w,
+            ray_dirs_w,
+            mesh=RayCaster.meshes["/World/ground"],
+            max_dist=self.lidar_range,
+        )[0]
+        dist = torch.linalg.norm(hits_w - ray_starts_w, dim=-1, keepdim=True)
+        invalid = (dist >= self.lidar_range) | (dist < self.lidar_min_range) | ~torch.isfinite(dist)
+        truncated = ray_starts_w + ray_dirs_w * self.lidar_range
+        return torch.where(invalid, truncated, hits_w)
+
+    def _dynamic_hits(self, lidar_pos_w, ray_dirs_w, point_time_offsets=None):
+        ray_origins_w = lidar_pos_w if lidar_pos_w.ndim == 3 else lidar_pos_w.unsqueeze(1)
+        if self.dyn_obs_state.shape[0] == 0:
+            dyn_vel = torch.zeros((0, 3), device=self.device)
+            hits = ray_origins_w + ray_dirs_w * self.lidar_range
+            mask = torch.zeros(hits.shape[:2], dtype=torch.bool, device=self.device)
+            idx = torch.zeros(hits.shape[:2], dtype=torch.long, device=self.device)
+            return hits, mask, idx, dyn_vel
+        dyn_pos = self.dyn_obs_state[:, :3].to(self.device)
+        dyn_radius = self.dyn_obs_size[:, 0].to(self.device)
+        dyn_vel = self.dyn_obs_state[:, 7:10].to(self.device)
+        if point_time_offsets is not None:
+            dyn_pos = dynamic_sphere_positions_at_rays(
+                dyn_pos, dyn_vel, point_time_offsets, self.dyn_obs_accel
+            )
+        hits, mask, idx = sphere_lidar_hits(self.lidar_range, dyn_pos, dyn_radius, lidar_pos_w, ray_dirs_w)
+        dyn_dist = torch.linalg.norm(hits - ray_origins_w, dim=-1)
+        too_close = mask & (dyn_dist < self.lidar_min_range)
+        if too_close.any():
+            hits = torch.where(
+                too_close.unsqueeze(-1),
+                ray_origins_w + ray_dirs_w * self.lidar_range,
+                hits,
+            )
+            mask = mask & ~too_close
+        return hits, mask, idx, dyn_vel
+
+    def _capture_raw(self):
+        ray_dirs_body, point_time_offsets = generate_mid360_nonrepetitive_pattern(
+            num_envs=self.num_envs,
+            points_per_frame=self.scan_points_per_frame,
+            vfov_deg=tuple(self.cfg.sensor.vfov_deg),
+            scan_duration=self.scan_duration,
+            frame_index=self.scan_frame_index,
+            phase=self.scan_phase,
+            device=self.device,
+        )
+        self.scan_frame_index += 1
+        self.ray_dirs_body = ray_dirs_body
+        # Use the explicitly integrated sensor pose. RayCaster's independent
+        # PhysX view is stale until a full simulation step updates child links.
+        # Clone position because advance_sensor_motion updates it in-place.
+        lidar_pos_w = self.sensor_pos_w.clone()
+        lidar_quat_w = self.sensor_quat_w.clone()
+        ray_origins_w, ray_quats_w = scan_ray_poses(
+            lidar_pos_w,
+            lidar_quat_w,
+            self.sensor_linear_vel_w,
+            self.sensor_linear_accel_w,
+            self.sensor_angular_vel_body,
+            self.sensor_angular_accel_body,
+            point_time_offsets,
+        )
+        ray_dirs_w = quat_rotate(ray_quats_w, self.ray_dirs_body)
+        static_hits = self._static_hits_clamped(ray_origins_w, ray_dirs_w)
+        dyn_hits, dyn_mask, dyn_idx, dyn_vel = self._dynamic_hits(
+            ray_origins_w, ray_dirs_w, point_time_offsets
+        )
+        if self.return_dropout_prob > 0:
+            keep_return = torch.rand_like(dyn_mask, dtype=torch.float32) >= self.return_dropout_prob
+            truncated = ray_origins_w + ray_dirs_w * self.lidar_range
+            static_hits = torch.where(keep_return.unsqueeze(-1), static_hits, truncated)
+            dyn_hits = torch.where(keep_return.unsqueeze(-1), dyn_hits, truncated)
+            dyn_mask = dyn_mask & keep_return
+        merged_hits = merge_hits_by_nearest(static_hits, dyn_hits, ray_origins_w, dyn_mask)
+        input_return_valid = (
+            torch.linalg.norm(merged_hits - ray_origins_w, dim=-1) < self.lidar_range - 1e-4
+        )
+        input_hits = merged_hits
+        if self.range_noise_std_m > 0:
+            measured_range = torch.linalg.norm(merged_hits - ray_origins_w, dim=-1)
+            has_return = measured_range < (self.lidar_range - 1e-4)
+            noisy_range = measured_range + torch.randn_like(measured_range) * self.range_noise_std_m
+            noisy_range = noisy_range.clamp(self.lidar_min_range, self.lidar_range)
+            noisy_range = torch.where(has_return, noisy_range, torch.full_like(noisy_range, self.lidar_range))
+            input_hits = ray_origins_w + ray_dirs_w * noisy_range.unsqueeze(-1)
+        return {
+            "pos_w": lidar_pos_w,
+            "quat_w": lidar_quat_w,
+            "static_hits": static_hits,
+            "dyn_hits": dyn_hits,
+            "dyn_mask": dyn_mask,
+            "dyn_idx": dyn_idx,
+            "dyn_vel": dyn_vel,
+            "merged_hits": merged_hits,
+            "input_hits": input_hits,
+            "input_return_valid": input_return_valid,
+            "point_time_offsets": point_time_offsets,
+            "ray_origins_w": ray_origins_w,
+            "valid_return_fraction": (
+                torch.linalg.norm(input_hits - ray_origins_w, dim=-1) < self.lidar_range - 1e-4
+            ).float().mean(dim=1),
+        }
+
+    @torch.no_grad()
+    def collect_supervised_batch(self):
+        if bool(self.cfg.collection.randomize_pose_each_sample):
+            self.randomize_sensor_poses(torch.arange(self.num_envs, device=self.device))
+        self.sample_sensor_motion()
+        prev = self._capture_raw()
+        if "steps_between_frames_range" in self.cfg.collection:
+            step_min, step_max = self.cfg.collection.steps_between_frames_range
+            steps_between_frames = int(
+                torch.randint(int(step_min), int(step_max) + 1, (1,), device=self.device).item()
+            )
+        else:
+            steps_between_frames = int(self.cfg.collection.steps_between_frames)
+        for _ in range(steps_between_frames):
+            self.move_dynamic_obstacles()
+            self.advance_sensor_motion(float(self.cfg.sim.dt))
+        curr = self._capture_raw()
+
+        alignment_position_noise = torch.randn_like(curr["pos_w"]) * self.alignment_position_std_m
+        alignment_rotation_noise = (
+            torch.randn(self.num_envs, 3, device=self.device) * self.alignment_rotation_std_rad
+        )
+        alignment_pos_w = curr["pos_w"] + alignment_position_noise
+        alignment_quat_w = integrate_body_angular_velocity(
+            curr["quat_w"],
+            alignment_rotation_noise,
+            1.0,
+        )
+        delta_t = steps_between_frames * float(self.cfg.sim.dt)
+        batch = build_supervised_batch_from_isaac(
+            curr["static_hits"],
+            curr["dyn_hits"],
+            prev["input_hits"],
+            curr["dyn_mask"],
+            curr["dyn_idx"],
+            curr["dyn_vel"],
+            curr["pos_w"],
+            curr["quat_w"],
+            self.panorama_spec,
+            dyn_max_vel=float(self.cfg.collection.dyn_max_vel),
+            delta_t=delta_t,
+            curr_input_hits_w=curr["input_hits"],
+            prev_alignment_pos_w=alignment_pos_w,
+            prev_alignment_quat_w=alignment_quat_w,
+            curr_return_valid=curr["input_return_valid"],
+            prev_return_valid=prev["input_return_valid"],
+            curr_ray_origins_w=curr["ray_origins_w"],
+        )
+        valid_delta_t_range = self.cfg.collection.get("valid_delta_t_range", [0.05, 0.15])
+        validate_supervised_batch(
+            batch,
+            expected_size=(self.panorama_spec.height, self.panorama_spec.width),
+            min_delta_t=float(valid_delta_t_range[0]),
+            max_delta_t=float(valid_delta_t_range[1]),
+        )
+        batch["scan_duration"] = torch.full(
+            (self.num_envs,), self.scan_duration, device=self.device, dtype=batch["input"].dtype
+        )
+        batch["raw_point_count"] = torch.full(
+            (self.num_envs,), self.scan_points_per_frame, device=self.device, dtype=torch.int32
+        )
+        batch["nominal_point_count"] = torch.full(
+            (self.num_envs,), self.nominal_points_per_frame, device=self.device, dtype=torch.int32
+        )
+        batch["valid_return_fraction"] = curr["valid_return_fraction"]
+        curr_valid_bins = batch["input"][:, 2] > 0.5
+        prev_valid_bins = batch["input"][:, 3] > 0.5
+        batch["panorama_occupancy"] = curr_valid_bins.float().mean(dim=(1, 2))
+        batch["row_occupancy"] = curr_valid_bins.float().mean(dim=2)
+        overlap = (curr_valid_bins & prev_valid_bins).sum(dim=(1, 2)).float()
+        union = (curr_valid_bins | prev_valid_bins).sum(dim=(1, 2)).float().clamp_min(1.0)
+        batch["consecutive_frame_overlap"] = overlap / union
+        ego_translation = curr["pos_w"] - prev["pos_w"]
+        quat_dot = (curr["quat_w"] * prev["quat_w"]).sum(dim=-1).abs().clamp(max=1.0)
+        batch["frame_interval_steps"] = torch.full(
+            (self.num_envs,), steps_between_frames, device=self.device, dtype=torch.int32
+        )
+        batch["ego_translation_m"] = torch.linalg.norm(ego_translation, dim=-1)
+        batch["ego_rotation_deg"] = 2.0 * torch.acos(quat_dot) * 180.0 / torch.pi
+        # Store the full current body-frame (FLU) ego velocity so downstream
+        # risk evaluation can form V_rel = V_abs - V_ego for every ray.
+        quat_w_conj = self.sensor_quat_w.clone()
+        quat_w_conj[:, 1:] = -quat_w_conj[:, 1:]
+        ego_velocity_body_mps = quat_rotate(quat_w_conj, self.sensor_linear_vel_w)
+        batch["ego_velocity_body_mps"] = ego_velocity_body_mps
+        batch["ego_linear_speed_mps"] = torch.linalg.norm(ego_velocity_body_mps, dim=-1)
+        batch["ego_angular_speed_deg_s"] = (
+            torch.linalg.norm(self.sensor_angular_vel_body, dim=-1) * 180.0 / torch.pi
+        )
+        batch["alignment_position_error_m"] = torch.linalg.norm(alignment_position_noise, dim=-1)
+        batch["alignment_rotation_error_deg"] = (
+            torch.linalg.norm(alignment_rotation_noise, dim=-1) * 180.0 / torch.pi
+        )
+        batch["scene_id"] = torch.full(
+            (self.num_envs,), int(self.cfg.collection.get("scene_id", self.cfg.env.static_seed)),
+            device=self.device,
+            dtype=torch.int32,
+        )
+        return batch

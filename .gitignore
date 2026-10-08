@@ -1,0 +1,71 @@
+# Python caches, environments and packaging
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+.ipynb_checkpoints/
+
+# ROS / catkin and native build artifacts
+build/
+devel/
+install/
+log/
+logs/
+.catkin_tools/
+.ros/
+cmake-build-*/
+*.o
+*.a
+
+# Local datasets and evaluation outputs
+/perception_training/data/
+/Dnav_ws/evaluation_results/*
+!/Dnav_ws/evaluation_results/README.md
+*.bag
+*.bag.active
+*.db3
+*.mcap
+
+# Training runs, checkpoints and visualization output
+wandb/
+outputs/
+multirun/
+runs/
+checkpoints/
+events.out.tfevents.*
+/rl-training/training_net2_SAMnet_reward_cbf/progress/
+/rl-training/training_net2_SAMnet_reward_cbf/scripts/test/output_debug_frames/
+# Keep deployment weights in weights/ and dnav_perception/models/ tracked.
+
+# Local credentials (keep shareable environment templates)
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Editor settings and temporary files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+
+# Misspelled local ignore directory; Git reads .gitignore instead
+/.gitnore/

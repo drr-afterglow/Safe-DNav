@@ -1,0 +1,87 @@
+sensor:
+  model: mid360
+  sampling:
+    profile: mid360_nonrepetitive_approx
+    nominal_point_rate_hz: 200000
+    scan_duration: 0.096
+    simulated_points_per_frame: 5760
+  network:
+    height: 16
+    width: 180
+  rl:
+    height: 6
+    width: 36
+  max_range: 10.0
+  vfov_deg:
+  - -7.0
+  - 52.0
+  max_scan_duration: 0.15
+model:
+  input_channels: 4
+  base_channels: 16
+  reference_delta_t: 0.096
+  min_delta_t: 0.05
+  max_delta_t: 0.15
+data:
+  roots:
+  - perception_training/data
+  val_ratio: 0.1
+  cache_size: 4
+  train_roots:
+  - /root/autodl-tmp/NavRL_perception_intermediate_12k/train
+  val_roots:
+  - /root/autodl-tmp/NavRL_perception_intermediate_12k/val
+augmentation:
+  beam_dropout: 0.1
+  range_noise_std: 0.002
+  max_range_norm: 1.0
+loss:
+  lambda_seg: 1.0
+  lambda_kin: 1.0
+  lambda_static: 0.1
+  focal_alpha: 0.75
+  focal_gamma: 2.0
+  dice_weight: 1.0
+  velocity_component_weights: [2.0, 1.0, 1.0]
+evaluation:
+  mask_threshold: 0.5
+  distance_bins_m:
+  - 0.0
+  - 2.0
+  - 5.0
+  - 10.0
+  pool_output_size:
+  - 6
+  - 36
+  seam_width: 3
+  static_speed_hist_max_mps: 10.0
+  static_speed_hist_bins: 1024
+  checkpoint_selection:
+    dyn_max_vel_mps: 5.0
+    iou_weight: 1.0
+    recall_weight: 1.0
+    velocity_weight: 1.0
+    static_speed_weight: 1.0
+training:
+  seed: 0
+  device: cuda:0
+  batch_size: 256
+  num_workers: 4
+  epochs: 80
+  lr: 0.0005
+  weight_decay: 0.0001
+  save_every: 10
+  log_interval_steps: 0
+  output_dir: /root/autodl-tmp/NavRL_perception_intermediate_12k/runs/radial_weight_2x_fp32
+  amp:
+    enabled: false
+    dtype: float16
+    allow_tf32: false
+  cudnn_benchmark: false
+  matmul_precision: highest
+wandb:
+  enabled: false
+  project: NavRL-perception
+  name: sa-umnet
+  entity: null
+  mode: online

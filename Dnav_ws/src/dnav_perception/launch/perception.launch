@@ -1,0 +1,10 @@
+<launch>
+  <arg name="config" default="$(find dnav_perception)/config/perception.yaml"/>
+  <arg name="device" default="cuda"/>
+  <arg name="python_executable" default="/home/amo/miniconda3/envs/NavRL/bin/python"/>
+  <rosparam command="load" file="$(arg config)" ns="dnav_perception"/>
+  <param name="dnav_perception/device" value="$(arg device)"/>
+  <node pkg="dnav_perception" type="dnav_perception_node.py"
+        name="dnav_perception" output="screen" required="true"
+        launch-prefix="$(arg python_executable)"/>
+</launch>

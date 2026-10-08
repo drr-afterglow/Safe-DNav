@@ -1,0 +1,22 @@
+scenarios:
+  - name: tunnel_single_dynamic_head_on
+    world: worlds/tunnel/tunnel_dynamic_1.world
+    # Fly against the pedestrian's initial x=2 -> x=7 motion so that the
+    # episode contains a deterministic head-on encounter in the tunnel.
+    start: [7.0, 0.0, 0.1]
+    yaw: 3.141592653589793
+    goal: [0.0, 0.0, 1.0]
+    timeout: 35.0
+    max_horizontal_speed: 1.0
+    dynamic_model_tokens: [person]
+
+  - name: simple_box_three_dynamic_crossing
+    world: worlds/simple_box/simple_box_dynamic_3.world
+    start: [0.0, 0.0, 0.1]
+    yaw: 0.0
+    goal: [6.0, 0.0, 1.0]
+    # Two pedestrians cross the direct route at x=2.8 and x=5.0. Allow time
+    # for yielding plus the static-box detour already present in this world.
+    timeout: 45.0
+    max_horizontal_speed: 1.0
+    dynamic_model_tokens: [person]

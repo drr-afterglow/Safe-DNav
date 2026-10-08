@@ -1,0 +1,30 @@
+# Evaluation-only A/B configuration. Keep the production controller defaults
+# unchanged while measuring sensitivity to the command response limit.
+control_rate: 50.0
+diagnostics_rate: 5.0
+policy_topic: /dnav/policy/world_velocity
+odometry_topic: /dnav/uav/odom_raw
+flight_state_topic: /dnav/uav/flight_state
+enable_topic: /dnav/controller/enable
+emergency_stop_topic: /dnav/controller/emergency_stop
+reset_emergency_stop_service: /dnav/controller/reset_emergency_stop
+output_topic: /dnav/uav/cmd_vel
+state_topic: /dnav/controller/state
+diagnostics_topic: /dnav/controller/diagnostics
+world_frame: map
+body_frame: base_link
+output_frame: base_link
+policy_timeout: 0.10
+odometry_timeout: 0.10
+flight_state_timeout: 0.20
+future_stamp_tolerance: 0.05
+max_control_period: 0.10
+max_tilt_deg: 45.0
+max_horizontal_speed: 0.5
+max_ascent_speed: 0.4
+max_descent_speed: 0.3
+max_horizontal_acceleration: 2.0
+max_vertical_acceleration: 0.5
+min_altitude: 0.5
+max_altitude: 4.0
+altitude_soft_margin: 0.5

@@ -1,0 +1,85 @@
+sensor:
+  model: mid360
+  # Perception data follows a non-repetitive MID-360 approximation. The
+  # 36x6 tensor exists only after postprocessing at the PPO interface.
+  sampling:
+    profile: mid360_nonrepetitive_approx
+    nominal_point_rate_hz: 200000
+    scan_duration: 0.096
+    simulated_points_per_frame: 5760
+  # High-resolution panorama used by SA-UMNet before RL-interface pooling.
+  network:
+    height: 16
+    width: 180
+  # Frozen PPO interface size after risk-preserving postprocess pooling.
+  rl:
+    height: 6
+    width: 36
+  max_range: 10.0
+  vfov_deg: [-7.0, 52.0]
+  # Maximum time span covered by points inside one deskewed scan frame.
+  max_scan_duration: 0.15
+
+model:
+  # Frozen input: current range, aligned previous range, then both valid maps.
+  input_channels: 4
+  base_channels: 16
+  # collection.steps_between_frames (6) * sim.dt (0.016 s)
+  reference_delta_t: 0.096
+  min_delta_t: 0.05
+  max_delta_t: 0.15
+
+data:
+  roots:
+    - perception_training/data
+  val_ratio: 0.1
+  # Per worker; shard-aware sampling keeps the active working set small.
+  cache_size: 4
+
+augmentation:
+  beam_dropout: 0.1
+  range_noise_std: 0.002
+  max_range_norm: 1.0
+
+loss:
+  lambda_seg: 1.0
+  lambda_kin: 1.0
+  lambda_static: 0.1
+  focal_alpha: 0.75
+  focal_gamma: 2.0
+  dice_weight: 1.0
+
+evaluation:
+  mask_threshold: 0.5
+  distance_bins_m: [0.0, 2.0, 5.0, 10.0]
+  pool_output_size: [6, 36]
+  seam_width: 3
+  # Fixed-memory approximation for the static false-speed 95th percentile.
+  static_speed_hist_max_mps: 10.0
+  static_speed_hist_bins: 1024
+  # Best checkpoint balances segmentation with dynamic/static velocity errors.
+  checkpoint_selection:
+    dyn_max_vel_mps: 5.0
+    iou_weight: 1.0
+    recall_weight: 1.0
+    velocity_weight: 1.0
+    static_speed_weight: 1.0
+
+training:
+  seed: 0
+  device: cuda:0
+  batch_size: 512
+  num_workers: 8
+  epochs: 80
+  lr: 0.0005
+  weight_decay: 0.0001
+  save_every: 10
+  log_interval_steps: 10
+  output_dir: perception_training/runs/default
+
+wandb:
+  enabled: false
+  project: NavRL-perception
+  name: sa-umnet
+  entity:
+  mode: online

@@ -1,0 +1,10 @@
+<launch>
+  <arg name="config" default="$(find dnav_policy)/config/policy.yaml"/>
+  <arg name="device" default="cpu"/>
+  <arg name="python_executable" default="/home/amo/miniconda3/envs/NavRL/bin/python"/>
+  <rosparam command="load" file="$(arg config)" ns="dnav_policy"/>
+  <param name="dnav_policy/device" value="$(arg device)"/>
+  <node pkg="dnav_policy" type="dnav_policy_node.py"
+        name="dnav_policy" output="screen" required="true"
+        launch-prefix="$(arg python_executable)"/>
+</launch>

@@ -1,0 +1,52 @@
+<launch>
+  <arg name="paused" default="false"/>
+  <arg name="verbose" default="false"/>
+  <arg name="use_sim_time" default="true"/>
+  <arg name="debug" default="false" />
+  <arg name="gui" default="true"/>
+  <arg name="spawn_x" default="-15.0"/>
+  <arg name="spawn_y" default="0.0"/>
+  <arg name="spawn_z" default="0.1"/>
+  <arg name="spawn_yaw" default="0.0"/>
+
+  
+  <arg name="world_name" default="$(find dnav_gazebo)/worlds/generated_env/generated_env_static.world" />
+  <!-- <arg name="world_name" default="$(find dnav_gazebo)/worlds/generated_env/generated_env_dynamic.world" /> -->
+  <!-- <arg name="world_name" default="$(find dnav_gazebo)/worlds/generated_env/generated_env_initial.world" /> -->
+
+  
+  <!-- launch the custom world -->
+  <include file="$(find gazebo_ros)/launch/empty_world.launch" >
+        <arg name="paused" value="$(arg paused)"/>
+        <arg name="world_name" value="$(arg world_name)"/>
+        <arg name="verbose" value="$(arg verbose)"/>
+        <arg name="use_sim_time" value="$(arg use_sim_time)"/>
+        <arg name="debug" value="$(arg debug)" />
+        <arg name="gui" value="$(arg gui)" />
+  </include>
+
+
+   <!-- send robot urdf to param server -->
+  <param name="robot_description" command="cat '$(find dnav_gazebo)/urdf/quadcopter.urdf'" />
+
+  <!-- push robot_description to factory and spawn robot in gazebo at the origin, change x,y,z arguments to spawn in a different position -->
+  <!-- <node name="spawn_gazebo_model" pkg="gazebo_ros" type="spawn_model" args="-urdf -param robot_description -model quadcopter -x 0 -y 0 -z 0.1" respawn="false" /> -->
+
+  <node pkg="topic_tools" type="throttle" name="gt_pose_throttle" args="messages /dnav/uav/pose_raw 30 /dnav/uav/pose"/>
+  <node pkg="topic_tools" type="throttle" name="gt_vel_throttle" args="messages /dnav/uav/vel_raw 30 /dnav/uav/vel"/>
+  <node pkg="topic_tools" type="throttle" name="gt_acc_throttle" args="messages /dnav/uav/acc_raw 30 /dnav/uav/acc"/>
+  <node pkg="topic_tools" type="throttle" name="gt_odom_throttle" args="messages /dnav/uav/odom_raw 30 /dnav/uav/odom"/>
+  <node name="spawn_gazebo_model" pkg="gazebo_ros" type="spawn_model"
+        args="-urdf -param robot_description -model quadcopter -x $(arg spawn_x) -y $(arg spawn_y) -z $(arg spawn_z) -Y $(arg spawn_yaw)"
+        respawn="false" />
+
+  <!-- TF -->
+  <include file="$(find dnav_gazebo)/launch/setupTF.launch" >
+    <arg name="pose_topic" value="/dnav/uav/pose" />
+  </include>
+
+  <node name="keyboard_control" pkg="dnav_gazebo" type="keyboard_control" />
+
+  <!-- <include file="$(find dnav_gazebo)/launch/rviz.launch"></include> -->
+
+</launch>
